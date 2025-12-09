@@ -106,7 +106,7 @@ class PanRigAPI: ObservableObject {
         }
 
         DispatchQueue.main.async { self.statusText = "Sending…" }
-        
+
         // Use WKWebView which uses Safari's networking stack
         // This bypasses iOS's connectivity checks that block URLSession/NWConnection
         webRequester.request(url: url) { [weak self] success in

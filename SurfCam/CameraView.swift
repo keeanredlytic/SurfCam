@@ -27,6 +27,8 @@ struct CameraView: UIViewRepresentable {
         // Give zoom controller access to the camera manager
         zoomController?.cameraManager = cameraManager
         zoomController?.videoDevice = cameraManager.videoDevice
+        // And give camera manager an optional back-reference to zoom controller
+        cameraManager.zoomController = zoomController
         
         // Setup and start the session
         cameraManager.setupSession()
@@ -63,7 +65,7 @@ struct CameraView: UIViewRepresentable {
         // This is called when SwiftUI detects layout changes (including rotation)
         DispatchQueue.main.async {
             cameraManager.updateOrientation()
-            faceTracker.updateOrientation()
+        faceTracker.updateOrientation()
         }
     }
     
@@ -83,7 +85,7 @@ struct CameraView: UIViewRepresentable {
         }
         
         @objc func orientationChanged() {
-            DispatchQueue.main.async { [weak self] in
+                DispatchQueue.main.async { [weak self] in
                 self?.cameraManager?.updateOrientation()
                 self?.faceTracker.updateOrientation()
             }

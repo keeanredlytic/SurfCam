@@ -11,14 +11,14 @@ struct ContentView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 10) {
-                Text("SurfCam GPS")
-                    .font(.headline)
-                
-                if let loc = locationManager.currentLocation {
+            Text("SurfCam GPS")
+                .font(.headline)
+            
+            if let loc = locationManager.currentLocation {
                     VStack(spacing: 2) {
-                        Text(String(format: "%.5f", loc.coordinate.latitude))
+                    Text(String(format: "%.5f", loc.coordinate.latitude))
                             .font(.system(.caption2, design: .monospaced))
-                        Text(String(format: "%.5f", loc.coordinate.longitude))
+                    Text(String(format: "%.5f", loc.coordinate.longitude))
                             .font(.system(.caption2, design: .monospaced))
                         
                         // Accuracy indicator with color coding
@@ -29,33 +29,33 @@ struct ContentView: View {
                             
                             if locationManager.isTracking {
                                 Text(String(format: "%.1f Hz", locationManager.updateRate))
-                                    .font(.caption2)
+                        .font(.caption2)
                                     .foregroundColor(.blue)
                             }
                         }
-                    }
-                } else {
-                    Text("No GPS")
-                        .font(.caption)
-                        .foregroundColor(.gray)
                 }
-                
+            } else {
+                Text("No GPS")
+                        .font(.caption)
+                    .foregroundColor(.gray)
+            }
+            
                 // Start/Stop tracking button
-                Button(action: {
-                    if locationManager.isTracking {
-                        locationManager.stop()
-                    } else {
-                        locationManager.start()
-                    }
-                }) {
+            Button(action: {
+                if locationManager.isTracking {
+                    locationManager.stop()
+                } else {
+                    locationManager.start()
+                }
+            }) {
                     HStack {
                         Image(systemName: locationManager.isTracking ? "stop.fill" : "location.fill")
-                        Text(locationManager.isTracking ? "Stop" : "Start")
+                Text(locationManager.isTracking ? "Stop" : "Start")
                     }
                     .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(locationManager.isTracking ? .red : .green)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(locationManager.isTracking ? .red : .green)
                 
                 if locationManager.isTracking {
                     Text("Workout active")
@@ -93,12 +93,24 @@ struct ContentView: View {
                         }) {
                             HStack {
                                 Image(systemName: "target")
-                                Text("Calibrate (7s)")
+                                Text("Calibrate Center")
                             }
                             .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.bordered)
                         .tint(.orange)
+                        
+                        Button(action: {
+                            locationManager.startRigCalibrationFromWatch()
+                        }) {
+                            HStack {
+                                Image(systemName: "mappin.and.ellipse")
+                                Text("Calibrate Rig (Watch)")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.blue)
                         
                         // Show last calibration result
                         if let result = locationManager.lastCalibrationResult {
@@ -113,8 +125,8 @@ struct ContentView: View {
                         .foregroundColor(.gray)
                         .multilineTextAlignment(.center)
                 }
-            }
-            .padding()
+        }
+        .padding()
         }
     }
     

@@ -26,6 +26,9 @@ class FaceTracker: ObservableObject {
     // Currently tracked person ID (for continuity scoring)
     @Published var currentTargetID: UUID?
 
+    // Bounding box of the current tracked person (normalized 0..1)
+    @Published var targetBoundingBox: CGRect?
+
     private let visionQueue = DispatchQueue(label: "FaceTracker.visionQueue")
     private var smoothedCenter: CGPoint? = nil
     
@@ -71,10 +74,11 @@ class FaceTracker: ObservableObject {
         faceCenter = nil
         currentTargetID = nil
         allDetections = []
+        targetBoundingBox = nil
     }
 
     private var frameCount = 0
-    
+
     func process(_ sampleBuffer: CMSampleBuffer) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
@@ -121,6 +125,7 @@ class FaceTracker: ObservableObject {
                     self.faceCenter = nil
                     self.smoothedCenter = nil
                     self.allDetections = []
+                    self.targetBoundingBox = nil
                     // Don't clear currentTargetID - keep it for when they reappear
                 }
                 return
@@ -152,12 +157,14 @@ class FaceTracker: ObservableObject {
             let rawCenter = CGPoint(x: chosen.x, y: chosen.y)
 
             // Low-pass filter to smooth jitter
-            let alpha: CGFloat = 0.3   // 0 = very smooth, 1 = no smoothing
+            // Make X more reactive while keeping Y smoothing
+            let alphaX: CGFloat = 0.5   // more responsive horizontally
+            let alphaY: CGFloat = 0.3   // keep vertical smoothing
             let newCenter: CGPoint
             if let prev = self.smoothedCenter {
                 newCenter = CGPoint(
-                    x: prev.x * (1 - alpha) + rawCenter.x * alpha,
-                    y: prev.y * (1 - alpha) + rawCenter.y * alpha
+                    x: prev.x * (1 - alphaX) + rawCenter.x * alphaX,
+                    y: prev.y * (1 - alphaY) + rawCenter.y * alphaY
                 )
             } else {
                 newCenter = rawCenter
@@ -167,6 +174,13 @@ class FaceTracker: ObservableObject {
                 self.smoothedCenter = newCenter
                 self.faceCenter = newCenter
                 self.allDetections = detections
+                self.currentTargetID = chosen.id
+                self.targetBoundingBox = CGRect(
+                    x: chosen.x - chosen.width / 2,
+                    y: chosen.y - chosen.height / 2,
+                    width: chosen.width,
+                    height: chosen.height
+                )
             }
         }
 

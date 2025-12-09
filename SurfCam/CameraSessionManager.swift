@@ -37,6 +37,43 @@ class CameraSessionManager: NSObject, ObservableObject {
     private(set) var movieOutput: AVCaptureMovieFileOutput?
     private(set) var previewLayer: AVCaptureVideoPreviewLayer?
     
+    // MARK: - Zoom / Controller Reference
+    
+    /// Optional back-reference to the zoom controller so we can keep its zoomFactor in sync
+    weak var zoomController: ZoomController?
+    
+    // MARK: - Back Camera Selection
+    
+    /// Selects the best available back camera for multi-lens zoom support
+    private func makeBackCameraDevice() -> AVCaptureDevice? {
+        // 1. Prefer the virtual triple camera on Pro devices (13/14/15/17 Pro, etc.)
+        if let triple = AVCaptureDevice.default(.builtInTripleCamera,
+                                                for: .video,
+                                                position: .back) {
+            print("📷 Using built-in triple camera")
+            return triple
+        }
+        
+        // 2. Fall back to dual-wide if triple isn't available
+        if let dualWide = AVCaptureDevice.default(.builtInDualWideCamera,
+                                                  for: .video,
+                                                  position: .back) {
+            print("📷 Using built-in dual wide camera")
+            return dualWide
+        }
+        
+        // 3. Final fallback: single wide-angle camera
+        if let wide = AVCaptureDevice.default(.builtInWideAngleCamera,
+                                              for: .video,
+                                              position: .back) {
+            print("📷 Using built-in wide-angle back camera")
+            return wide
+        }
+        
+        print("❌ No suitable back camera found")
+        return nil
+    }
+    
     // MARK: - Queues
     private let sessionQueue = DispatchQueue(label: "CameraSessionManager.sessionQueue")
     private let videoOutputQueue = DispatchQueue(label: "CameraSessionManager.videoOutputQueue")
@@ -63,16 +100,17 @@ class CameraSessionManager: NSObject, ObservableObject {
         session.inputs.forEach { session.removeInput($0) }
         session.outputs.forEach { session.removeOutput($0) }
         
-        // 1. Pick the back wide camera
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
-                                                    for: .video,
-                                                    position: .back) else {
+        // 1. Pick the best available back camera (multi-cam when possible)
+        guard let device = makeBackCameraDevice() else {
             print("❌ No back camera available")
             session.commitConfiguration()
             return
         }
         
         videoDevice = device
+        print("🎥 Selected camera: \(device.localizedName)")
+        print("   minZoom=\(device.minAvailableVideoZoomFactor)")
+        print("   maxZoom=\(device.maxAvailableVideoZoomFactor)")
         
         // 2. Configure resolution (1080p vs 4K)
         switch resolution {
@@ -419,12 +457,28 @@ class CameraSessionManager: NSObject, ObservableObject {
         
         do {
             try device.lockForConfiguration()
-            let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 6.0)
-            let clampedZoom = max(1.0, min(factor, maxZoom))
-            device.videoZoomFactor = clampedZoom
+            
+            // Use the device's real min/max zoom (allows ultra-wide 0.5x on triple-cam)
+            let minZoom = device.minAvailableVideoZoomFactor
+            let maxZoom = min(device.maxAvailableVideoZoomFactor, 24.0) // allow up to device max, cap at 24x
+            
+            let clamped = max(minZoom, min(factor, maxZoom))
+            
+            if device.isRampingVideoZoom {
+                device.cancelVideoZoomRamp()
+            }
+            
+            device.videoZoomFactor = clamped
             device.unlockForConfiguration()
+            
+            DispatchQueue.main.async { [weak self] in
+                // Keep ZoomController in sync
+                self?.zoomController?.syncZoomFactorFromDevice(clamped)
+            }
+            
+            print("🔍 Zoom: requested=\(factor), clamped=\(clamped), min=\(minZoom), max=\(maxZoom)")
         } catch {
-            print("Zoom error: \(error)")
+            print("❌ Zoom error: \(error)")
         }
     }
     

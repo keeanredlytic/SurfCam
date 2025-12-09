@@ -2,46 +2,49 @@ import CoreLocation
 import WatchConnectivity
 import HealthKit
 
+enum CalibrationMode {
+    case none
+    case center
+    case rig
+}
+
 class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObject {
     @Published var currentLocation: CLLocation?
     @Published var isTracking = false
     @Published var accuracy: Double = -1  // Current GPS accuracy in meters
     @Published var updateRate: Double = 0  // Updates per second
-    
-    // Center calibration state
+
+    // Center / rig calibration state
     @Published var isCalibrating = false
     @Published var calibrationProgress: Double = 0  // 0..1
     @Published var calibrationSampleCount = 0
     @Published var lastCalibrationResult: String?  // Status message
-    
+    private var calibrationMode: CalibrationMode = .none
+
     private let manager = CLLocationManager()
     private let session = WCSession.default
-    
+
     // HealthKit workout session to keep GPS alive and frequent
     private let healthStore = HKHealthStore()
     private var workoutSession: HKWorkoutSession?
     private var workoutBuilder: HKLiveWorkoutBuilder?
-    
+
     // Rate limiting and filtering
     private var lastSentAt: Date = .distantPast
     private let minSendInterval: TimeInterval = 0.2  // ~5 Hz max (matches servo loop)
-    private let maxAccuracy: Double = 15.0  // Reject points worse than 15m
-    private let maxAge: TimeInterval = 3.0  // Reject points older than 3 seconds
-    
+
     // Center calibration
     private var calibrationSamples: [CLLocation] = []
     private var calibrationTimer: Timer?
     private var calibrationStartTime: Date?
-    private let calibrationDuration: TimeInterval = 7.0  // 7 seconds
-    private let calibrationSampleInterval: TimeInterval = 0.3  // Sample every 0.3s
-    
+
     // Stats tracking
     private var updateCount = 0
     private var lastStatsReset = Date()
 
     override init() {
         super.init()
-        
+
         // Set up location manager with best settings for outdoor tracking
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation  // Best for outdoor GPS
@@ -49,7 +52,7 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
         manager.distanceFilter = kCLDistanceFilterNone  // Don't rate limit by distance
         // Note: pausesLocationUpdatesAutomatically and allowsBackgroundLocationUpdates
         // are iOS-only. On watchOS, the workout session keeps GPS active.
-        
+
         // Initialize WatchConnectivity
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self = self else { return }
@@ -58,19 +61,19 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
                 self.session.activate()
             }
         }
-        
+
         // Request authorization
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.requestAuthorizationIfNeeded()
         }
     }
-    
+
     private func requestAuthorizationIfNeeded() {
         let locationStatus = manager.authorizationStatus
         if locationStatus == .notDetermined {
             manager.requestWhenInUseAuthorization()
         }
-        
+
         // Request HealthKit authorization for workout sessions
         if HKHealthStore.isHealthDataAvailable() {
             let types: Set<HKSampleType> = [HKWorkoutType.workoutType()]
@@ -88,14 +91,14 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
             requestAuthorizationIfNeeded()
             return
         }
-        
+
         // Start workout session to keep GPS alive and frequent
         startWorkoutSession()
-        
+
         // Start location updates
         manager.startUpdatingLocation()
         isTracking = true
-        
+
         // Reset stats
         updateCount = 0
         lastStatsReset = Date()
@@ -106,11 +109,24 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
         stopWorkoutSession()
         isTracking = false
     }
-    
+
     // MARK: - Center Calibration
-    
+
     /// Start center calibration (call while standing where "center" should be)
     func startCenterCalibration() {
+        guard !isCalibrating else { return }
+        calibrationMode = .center
+        beginCalibration()
+    }
+    
+    /// Start rig calibration from watch (hold watch over the tripod)
+    func startRigCalibrationFromWatch() {
+        guard !isCalibrating else { return }
+        calibrationMode = .rig
+        beginCalibration()
+    }
+    
+    private func beginCalibration() {
         calibrationSamples.removeAll()
         calibrationTimer?.invalidate()
         calibrationStartTime = Date()
@@ -118,51 +134,22 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
         calibrationProgress = 0
         calibrationSampleCount = 0
         lastCalibrationResult = nil
-        
+
         // Ensure we're getting location updates
         let status = manager.authorizationStatus
         if status == .authorizedWhenInUse || status == .authorizedAlways {
+            manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
+            manager.distanceFilter = kCLDistanceFilterNone
             manager.startUpdatingLocation()
         } else {
             requestAuthorizationIfNeeded()
         }
-        
-        calibrationTimer = Timer.scheduledTimer(withTimeInterval: calibrationSampleInterval, repeats: true) { [weak self] timer in
-            guard let self = self else { return }
-            
-            let elapsed = Date().timeIntervalSince(self.calibrationStartTime ?? Date())
-            
-            DispatchQueue.main.async {
-                self.calibrationProgress = min(elapsed / self.calibrationDuration, 1.0)
-            }
-            
-            // Check if calibration window is complete
-            if elapsed >= self.calibrationDuration {
-                timer.invalidate()
-                self.finishCenterCalibration()
-                return
-            }
-            
-            // Sample current location
-            guard let loc = self.currentLocation else { return }
-            
-            // Filter: reject bad accuracy
-            if loc.horizontalAccuracy <= 0 || loc.horizontalAccuracy > 20 {
-                return
-            }
-            
-            // Filter: reject stale timestamps
-            if abs(loc.timestamp.timeIntervalSinceNow) > 3 {
-                return
-            }
-            
-            self.calibrationSamples.append(loc)
-            DispatchQueue.main.async {
-                self.calibrationSampleCount = self.calibrationSamples.count
-            }
+
+        calibrationTimer = Timer.scheduledTimer(withTimeInterval: CalibrationConfig.calibrationDuration, repeats: false) { [weak self] _ in
+            self?.finishCalibration()
         }
     }
-    
+
     /// Cancel ongoing calibration
     func cancelCenterCalibration() {
         calibrationTimer?.invalidate()
@@ -170,49 +157,75 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
         isCalibrating = false
         calibrationProgress = 0
         calibrationSamples.removeAll()
+        calibrationMode = .none
     }
-    
-    private func finishCenterCalibration() {
+
+    private func finishCalibration() {
+        calibrationTimer?.invalidate()
         calibrationTimer = nil
-        
+
         DispatchQueue.main.async {
             self.isCalibrating = false
             self.calibrationProgress = 1.0
         }
-        
-        guard let avgCoord = averagedCoordinate(from: calibrationSamples) else {
+
+        let samples = calibrationSamples
+        calibrationSamples.removeAll()
+
+        guard samples.count >= CalibrationConfig.minGoodSamples else {
             DispatchQueue.main.async {
-                self.lastCalibrationResult = "❌ Failed"
+                self.lastCalibrationResult = "❌ Failed (too few samples)"
             }
-            print("❌ Center calibration failed: not enough good samples (\(calibrationSamples.count))")
+            print("❌ Calibration failed: only \(samples.count) good samples (<\(CalibrationConfig.minGoodSamples)).")
+            calibrationMode = .none
             return
         }
-        
-        // Send calibration to phone via WatchConnectivity
-        sendCalibrationToPhone(avgCoord, sampleCount: calibrationSamples.count)
-        
-        DispatchQueue.main.async {
-            self.lastCalibrationResult = "✅ Sent"
+
+        guard let avgCoord = WatchLocationManager.weightedAverageCoordinate(from: samples) else {
+            DispatchQueue.main.async {
+                self.lastCalibrationResult = "❌ Failed (no average)"
+            }
+            print("❌ Calibration failed: no averaged coord.")
+            calibrationMode = .none
+            return
         }
-        print("✅ Center calibrated at \(avgCoord.latitude), \(avgCoord.longitude) from \(calibrationSamples.count) samples")
+
+        let avgAccuracy = samples.map { $0.horizontalAccuracy }.reduce(0, +) / Double(samples.count)
+
+        // Send calibration to phone via WatchConnectivity
+        switch calibrationMode {
+        case .center:
+            sendCenterCalibrationToPhone(avgCoord, sampleCount: samples.count, avgAccuracy: avgAccuracy)
+            DispatchQueue.main.async { self.lastCalibrationResult = "✅ Center sent" }
+            print("✅ Center calibrated at \(avgCoord.latitude), \(avgCoord.longitude) from \(samples.count) samples, avgAcc=\(avgAccuracy)m")
+        case .rig:
+            sendRigCalibrationToPhone(avgCoord, sampleCount: samples.count, avgAccuracy: avgAccuracy)
+            DispatchQueue.main.async { self.lastCalibrationResult = "✅ Rig sent" }
+            print("✅ Rig (watch) calibrated at \(avgCoord.latitude), \(avgCoord.longitude) from \(samples.count) samples, avgAcc=\(avgAccuracy)m")
+        case .none:
+            break
+        }
+        
+        calibrationMode = .none
     }
-    
-    private func sendCalibrationToPhone(_ coord: CLLocationCoordinate2D, sampleCount: Int) {
+
+    private func sendCenterCalibrationToPhone(_ coord: CLLocationCoordinate2D, sampleCount: Int, avgAccuracy: CLLocationAccuracy) {
         guard WCSession.isSupported(), session.isReachable else {
             DispatchQueue.main.async {
                 self.lastCalibrationResult = "⚠️ Phone not reachable"
             }
             return
         }
-        
+
         let payload: [String: Any] = [
             "centerCalibration": [
                 "lat": coord.latitude,
                 "lon": coord.longitude,
-                "samples": sampleCount
+                "samples": sampleCount,
+                "avgAccuracy": avgAccuracy
             ]
         ]
-        
+
         session.sendMessage(payload, replyHandler: nil) { [weak self] error in
             print("Failed to send calibration: \(error.localizedDescription)")
             DispatchQueue.main.async {
@@ -221,20 +234,68 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
         }
     }
     
+    private func sendRigCalibrationToPhone(_ coord: CLLocationCoordinate2D, sampleCount: Int, avgAccuracy: CLLocationAccuracy) {
+        guard WCSession.isSupported(), session.isReachable else {
+            DispatchQueue.main.async {
+                self.lastCalibrationResult = "⚠️ Phone not reachable"
+            }
+            return
+        }
+
+        let payload: [String: Any] = [
+            "rigCalibration": [
+                "lat": coord.latitude,
+                "lon": coord.longitude,
+                "samples": sampleCount,
+                "avgAccuracy": avgAccuracy
+            ]
+        ]
+
+        session.sendMessage(payload, replyHandler: nil) { [weak self] error in
+            print("Failed to send rig calibration: \(error.localizedDescription)")
+            DispatchQueue.main.async {
+                self?.lastCalibrationResult = "❌ Rig send failed"
+            }
+        }
+    }
+
+    private static func weightedAverageCoordinate(from locations: [CLLocation]) -> CLLocationCoordinate2D? {
+        guard !locations.isEmpty else { return nil }
+
+        var sumLat = 0.0
+        var sumLon = 0.0
+        var sumWeight = 0.0
+
+        for loc in locations {
+            let acc = max(loc.horizontalAccuracy, 0.5)
+            let w = 1.0 / (acc * acc)
+            sumLat += loc.coordinate.latitude * w
+            sumLon += loc.coordinate.longitude * w
+            sumWeight += w
+        }
+
+        guard sumWeight > 0 else { return nil }
+
+        return CLLocationCoordinate2D(
+            latitude: sumLat / sumWeight,
+            longitude: sumLon / sumWeight
+        )
+    }
+
     // MARK: - Workout Session (keeps GPS alive)
-    
+
     private func startWorkoutSession() {
         guard HKHealthStore.isHealthDataAvailable() else { return }
-        
+
         let config = HKWorkoutConfiguration()
         config.activityType = .walking  // Good for outdoor GPS tracking
         config.locationType = .outdoor
-        
+
         do {
             workoutSession = try HKWorkoutSession(healthStore: healthStore, configuration: config)
             workoutBuilder = workoutSession?.associatedWorkoutBuilder()
             workoutBuilder?.dataSource = HKLiveWorkoutDataSource(healthStore: healthStore, workoutConfiguration: config)
-            
+
             workoutSession?.startActivity(with: Date())
             workoutBuilder?.beginCollection(withStart: Date()) { success, error in
                 if let error = error {
@@ -246,7 +307,7 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
             print("Failed to start workout session: \(error.localizedDescription)")
         }
     }
-    
+
     private func stopWorkoutSession() {
         workoutSession?.end()
         workoutBuilder?.endCollection(withEnd: Date()) { success, error in
@@ -257,63 +318,87 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
         workoutSession = nil
         workoutBuilder = nil
     }
-    
+
     // MARK: - Location Updates
 
     func locationManager(_ manager: CLLocationManager,
                          didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
-        
+        let now = Date()
+
         // Update stats
         updateCount += 1
-        let elapsed = Date().timeIntervalSince(lastStatsReset)
-        if elapsed > 1.0 {
+        let elapsedStats = now.timeIntervalSince(lastStatsReset)
+        if elapsedStats > 1.0 {
             DispatchQueue.main.async {
-                self.updateRate = Double(self.updateCount) / elapsed
+                self.updateRate = Double(self.updateCount) / elapsedStats
             }
             updateCount = 0
-            lastStatsReset = Date()
+            lastStatsReset = now
         }
-        
+
         // Always update local display
         DispatchQueue.main.async {
             self.currentLocation = loc
             self.accuracy = loc.horizontalAccuracy
         }
-        
+
+        // Center calibration sampling
+        if isCalibrating, let start = calibrationStartTime {
+            for sample in locations {
+                let elapsed = now.timeIntervalSince(start)
+                DispatchQueue.main.async {
+                    self.calibrationProgress = min(1.0, elapsed / CalibrationConfig.calibrationDuration)
+                }
+
+                let acc = sample.horizontalAccuracy
+                guard acc > 0, acc <= CalibrationConfig.maxCalibrationAccuracy else { continue }
+
+                let age = now.timeIntervalSince(sample.timestamp)
+                guard abs(age) <= CalibrationConfig.sampleMaxAge else { continue }
+
+                calibrationSamples.append(sample)
+                DispatchQueue.main.async {
+                    self.calibrationSampleCount = self.calibrationSamples.count
+                    if self.calibrationSampleCount >= CalibrationConfig.minGoodSamples {
+                        self.finishCalibration()
+                    }
+                }
+            }
+        }
+
         // --- FILTERING: Only send good, fresh points ---
-        
         // 1) Reject invalid accuracy (negative means invalid)
         if loc.horizontalAccuracy < 0 {
             return
         }
-        
-        // 2) Reject poor accuracy (> 15 meters)
-        if loc.horizontalAccuracy > maxAccuracy {
+
+        // 2) Reject poor accuracy (> maxLiveAccuracy meters)
+        if loc.horizontalAccuracy > CalibrationConfig.maxLiveAccuracy {
             print("Skipping low accuracy point: \(loc.horizontalAccuracy)m")
             return
         }
-        
-        // 3) Reject stale timestamps (> 3 seconds old)
-        if abs(loc.timestamp.timeIntervalSinceNow) > maxAge {
+
+        // 3) Reject stale timestamps (> liveMaxAge seconds old)
+        if abs(loc.timestamp.timeIntervalSinceNow) > CalibrationConfig.liveMaxAge {
             print("Skipping stale point: \(abs(loc.timestamp.timeIntervalSinceNow))s old")
             return
         }
-        
+
         // 4) Rate limit sends (~5 Hz max)
-        let now = Date()
-        if now.timeIntervalSince(lastSentAt) < minSendInterval {
+        let nowSend = Date()
+        if nowSend.timeIntervalSince(lastSentAt) < minSendInterval {
             return
         }
-        lastSentAt = now
-        
+        lastSentAt = nowSend
+
         // --- SEND: Good point passes all filters ---
         sendLocationToPhone(loc)
     }
-    
+
     private func sendLocationToPhone(_ loc: CLLocation) {
         guard WCSession.isSupported(), session.isReachable else { return }
-        
+
         // Minimal payload for low overhead
         let payload: [String: Any] = [
             "lat": loc.coordinate.latitude,
@@ -321,16 +406,16 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
             "ts": loc.timestamp.timeIntervalSince1970,
             "acc": loc.horizontalAccuracy
         ]
-        
+
         session.sendMessage(["locations": [payload]], replyHandler: nil) { error in
             print("WC send error: \(error.localizedDescription)")
         }
     }
-    
+
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         print("Location error: \(error.localizedDescription)")
     }
-    
+
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         let status = manager.authorizationStatus
         if status == .denied || status == .restricted {
@@ -352,17 +437,15 @@ extension WatchLocationManager: WCSessionDelegate {
             print("WCSession activated with state: \(activationState.rawValue)")
         }
     }
-    
+
     #if os(iOS)
     func sessionDidBecomeInactive(_ session: WCSession) {
         // iOS only
     }
-    
+
     func sessionDidDeactivate(_ session: WCSession) {
         // iOS only - reactivate
         session.activate()
     }
     #endif
 }
-
-

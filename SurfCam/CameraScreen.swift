@@ -1,11 +1,24 @@
 import SwiftUI
+import Combine
 import CoreLocation
+
+final class CameraScreenViewModel: ObservableObject {
+    @Published var gpsDistanceMeters: Double?
+    @Published var gpsDistanceIsValid: Bool = false
+    @Published var latestWatchAccuracy: CLLocationAccuracy?
+}
 
 enum TrackingMode: String, CaseIterable {
     case off
     case cameraAI
     case watchGPS
     case gpsAI      // GPS+AI fusion - best of both worlds
+}
+
+enum TrackState {
+    case searching   // trying to find the surfer
+    case locked      // strong visual lock – Vision rules
+    case lost        // just lost them – rely on GPS to reacquire
 }
 
 struct CameraScreen: View {
@@ -15,6 +28,22 @@ struct CameraScreen: View {
     @ObservedObject var gpsTracker: WatchGPSTracker
     @ObservedObject var zoomController: ZoomController
     @ObservedObject var cameraManager: CameraSessionManager
+    @StateObject private var viewModel = CameraScreenViewModel()
+
+    // Explicit initializer to keep access public within the module
+    init(api: PanRigAPI,
+         faceTracker: FaceTracker,
+         rigLocationManager: RigLocationManager,
+         gpsTracker: WatchGPSTracker,
+         zoomController: ZoomController,
+         cameraManager: CameraSessionManager) {
+        self.api = api
+        self.faceTracker = faceTracker
+        self.rigLocationManager = rigLocationManager
+        self.gpsTracker = gpsTracker
+        self.zoomController = zoomController
+        self.cameraManager = cameraManager
+    }
 
     @State private var trackingMode: TrackingMode = .off
     @State private var trackingTimer: Timer? = nil
@@ -23,6 +52,61 @@ struct CameraScreen: View {
     @State private var isTrackingActive = false  // For GPS+AI mode - requires manual start
     @State private var showSystemPanel = false  // Toggle for system status panel
     @State private var use4K: Bool = false  // Resolution toggle: false = 1080p, true = 4K
+    @State private var showCenterDebug: Bool = true
+    
+    // MARK: - Tracking State Machine
+    @State private var trackState: TrackState = .searching
+    @State private var consecutiveLockFrames: Int = 0  // How many consecutive frames we've had a good vision lock
+    @State private var consecutiveLostFrames: Int = 0  // How many consecutive frames we've had no vision detection
+    
+    // Thresholds (tweakable)
+    private let lockFramesThreshold = 12    // ~1.2s at 10Hz
+    private let lostFramesThreshold = 8     // ~0.8s at 10Hz
+    
+    // MARK: - GPS Quality Metrics (Vision vs GPS alignment)
+    @State private var gpsBias: CGFloat = 0.0          // running average (gpsX - visionX)
+    @State private var gpsErrorRMS: CGFloat = 0.0      // running RMS of error
+    @State private var gpsSampleCount: Int = 0         // how many samples we've accumulated
+    
+    // Smoothing / scaling constants for GPS trust
+    private let gpsEMAAlpha: CGFloat = 0.05           // smaller = smoother, larger = more reactive
+    private let gpsMaxScreenErrorForTrust: CGFloat = 0.25  // ~25% of screen width treated as "very bad"
+    private let gpsMinSamplesForTrust: Int = 30        // need at least this many samples before trusting
+    
+    // MARK: - Servo Direction Control
+    private let servoMirror: CGFloat = -1.0  // 🔄 Change to 1.0 for normal direction, -1.0 to mirror
+    
+    // MARK: - Center Bias
+    /// Positive = shifts effective center in one direction, negative = other.
+    /// Start with +2; if the red dot moves the wrong way, change to -2.
+    private let centerBiasDegrees: CGFloat = -0.39
+
+    // MARK: - Distance + Motion State
+    /// Latest distance from rig to watch in meters (smoothed GPS)
+    @State private var gpsDistanceMeters: CLLocationDistance = 0.0
+    /// Latest estimated speed of the watch (m/s) based on last two samples
+    @State private var gpsSpeedMps: CLLocationDistance = 0.0
+    /// Latest instantaneous bearing from rig → watch (degrees 0–360)
+    @State private var gpsBearingRigToWatch: Double?
+    /// Smoothed / filtered bearing we actually use for servo control
+    @State private var gpsFilteredBearing: Double?
+    /// Motion direction heading based on watch movement (previous→current) in degrees
+    @State private var gpsMotionHeading: Double?
+    /// Last smoothed watch location, for speed + motion heading
+    @State private var lastSmoothedWatchLocation: CLLocation?
+    /// Smoothed subject width from Vision (for autoSubjectWidth)
+    private var smoothedSubjectWidth: CGFloat?
+    private var subjectWidthFrameCounter: Int = 0
+    
+    // MARK: - GPS + Vision Fusion Constants
+    /// When searching: how close Vision.x must be to GPS-predicted X (0–1) to accept a person
+    private let visionGpsMatchThreshold: CGFloat = 0.08     // ~8% of screen width
+    /// When locked: how far Vision.x is allowed to drift from GPS before we get suspicious
+    private let visionGpsDriftThreshold: CGFloat = 0.30     // ~30% of screen width
+    /// How many consecutive "bad drift" frames before we drop Vision lock
+    private let visionGpsDriftFrameLimit: Int = 15          // ~1.5s at 10Hz
+    /// Counter for drift frames in locked state
+    @State private var visionGpsDriftFrames: Int = 0
     
     var body: some View {
         GeometryReader { geometry in
@@ -30,12 +114,16 @@ struct CameraScreen: View {
             let bottomPadding: CGFloat = isLandscape ? 16 : 90
             let sidePadding: CGFloat = isLandscape ? 50 : 16
             
-                ZStack {
+                ZStack(alignment: .topTrailing) {
                 // Full screen camera view - black background for any gaps
                 Color.black.ignoresSafeArea()
                 
                 CameraView(faceTracker: faceTracker, cameraManager: cameraManager, zoomController: zoomController)
                         .ignoresSafeArea()
+                    
+                if showCenterDebug {
+                    CenterCalibrationOverlay(currentPreset: zoomController.currentPreset)
+                }
                     
                 // Center line overlay
                     GeometryReader { geo in
@@ -126,6 +214,11 @@ struct CameraScreen: View {
                         }
                         
                         Spacer()
+
+                        // Distance debug (center-ish in top row)
+                        distanceDebugLabel
+
+                        Spacer()
                         
                         // Status display with tracking indicator
                         if trackingMode != .off {
@@ -138,11 +231,11 @@ struct CameraScreen: View {
                                     .fill(isActive ? Color.green : Color.yellow)
                                     .frame(width: 6, height: 6)
                                 
-                                if trackingMode == .cameraAI {
+                    if trackingMode == .cameraAI {
                                     if faceTracker.faceCenter != nil {
                                         Text("👤")
                                             .font(.caption2)
-                                    } else {
+                        } else {
                                         Text("—")
                                             .font(.caption2)
                                             .foregroundColor(.white.opacity(0.5))
@@ -154,8 +247,8 @@ struct CameraScreen: View {
                                     if trackingMode == .gpsAI && faceTracker.faceCenter != nil {
                                         Text("👤")
                                             .font(.caption2)
-                                    }
-                        } else {
+                        }
+                    } else {
                                     Text("GPS...")
                                         .font(.caption2)
                                         .foregroundColor(.white.opacity(0.5))
@@ -175,21 +268,11 @@ struct CameraScreen: View {
                     // Bottom row: Zoom + Picker + Record button
                     HStack(alignment: .bottom, spacing: 12) {
                         // Left side: Zoom controls
-                        HStack(spacing: 3) {
-                            ForEach([1.0, 1.5, 2.0, 3.0], id: \.self) { zoom in
-                                Button(action: {
-                                    zoomController.mode = .fixed(CGFloat(zoom))
-                                    zoomController.setZoomLevel(CGFloat(zoom))
-                                }) {
-                                    Text(zoom == 1.0 ? "1x" : String(format: "%.0fx", zoom))
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .foregroundColor(isCurrentZoom(zoom) ? .black : .white)
-                                        .frame(width: 32, height: 28)
-                                        .background(isCurrentZoom(zoom) ? Color.yellow : Color.black.opacity(0.5))
-                                        .cornerRadius(6)
-                                }
-                            }
-                        }
+                        zoomButtons
+                        
+                        Spacer()
+                        
+                        autoZoomButton
                         
                         Spacer()
                         
@@ -200,8 +283,8 @@ struct CameraScreen: View {
                         Text("AI").tag(TrackingMode.cameraAI)
                         Text("GPS").tag(TrackingMode.watchGPS)
                                 Text("AI+").tag(TrackingMode.gpsAI)
-                            }
-                            .pickerStyle(.segmented)
+                    }
+                    .pickerStyle(.segmented)
                             .frame(width: isLandscape ? 180 : 200)
                             .scaleEffect(isLandscape ? 0.9 : 1.0)
                             
@@ -210,7 +293,7 @@ struct CameraScreen: View {
                                 Button(action: {
                                     isTrackingActive.toggle()
                                     if isTrackingActive {
-                                        restartTrackingTimer()
+                    restartTrackingTimer()
                                     } else {
                                         stopTrackingTimer()
                                     }
@@ -300,14 +383,29 @@ struct CameraScreen: View {
                                                             ProgressView(value: rigLocationManager.calibrationProgress)
                                                                 .frame(width: 80)
                                                                 .tint(.yellow)
+                                                        Text("Samples: \(rigLocationManager.calibrationSampleCount)")
+                                                            .font(.caption2)
+                                                            .foregroundColor(.white.opacity(0.7))
+                                                        if let err = rigLocationManager.calibrationError {
+                                                            Text(err)
+                                                                .font(.caption2)
+                                                                .foregroundColor(.red)
+                                                                .lineLimit(2)
+                                                        }
                                                         } else if rigLocationManager.rigCalibratedCoord != nil {
                                                             Text("Calibrated ✓")
                                                                 .font(.caption2)
-                                                                .foregroundColor(.green)
-                                                        } else {
+                                .foregroundColor(.green)
+                        } else {
                                                             Text("Tap to calibrate")
                                                                 .font(.caption2)
-                                                                .foregroundColor(.orange)
+                                .foregroundColor(.orange)
+                                                        if let err = rigLocationManager.calibrationError {
+                                                            Text(err)
+                                                                .font(.caption2)
+                                                                .foregroundColor(.red)
+                                                                .lineLimit(2)
+                                                        }
                                                         }
                                                     }
                                                     Spacer()
@@ -331,10 +429,20 @@ struct CameraScreen: View {
                                                         Text("Calibrated ✓")
                                                             .font(.caption2)
                                                             .foregroundColor(.green)
+                                                    if gpsTracker.watchCalibrationSampleCount > 0 {
+                                                        Text("Samples: \(gpsTracker.watchCalibrationSampleCount)")
+                                                            .font(.caption2)
+                                                            .foregroundColor(.white.opacity(0.7))
+                                                    }
                                                     } else {
                                                         Text("Tap on Watch")
                                                             .font(.caption2)
                                                             .foregroundColor(.orange)
+                                                    if gpsTracker.watchCalibrationSampleCount > 0 {
+                                                        Text("Samples: \(gpsTracker.watchCalibrationSampleCount)")
+                                                            .font(.caption2)
+                                                            .foregroundColor(.white.opacity(0.7))
+                                                    }
                                                     }
                                                 }
                                                 Spacer()
@@ -496,6 +604,32 @@ struct CameraScreen: View {
                 } else {
                     // Off mode
                     stopTrackingTimer()
+                    // Reset state machine when turning off
+                    trackState = .searching
+                    consecutiveLockFrames = 0
+                    consecutiveLostFrames = 0
+                    visionGpsDriftFrames = 0
+                    
+                    // Optional: reset GPS quality metrics on full stop
+                    gpsBias = 0.0
+                    gpsErrorRMS = 0.0
+                    gpsSampleCount = 0
+                }
+                
+                // Reset tracking state machine when switching modes
+                if newMode == .cameraAI || newMode == .gpsAI {
+                    trackState = .searching
+                    consecutiveLockFrames = 0
+                    consecutiveLostFrames = 0
+                    visionGpsDriftFrames = 0
+                }
+                
+                // Reset GPS metrics when leaving GPS+AI mode
+                if newMode != .gpsAI {
+                    gpsBias = 0.0
+                    gpsErrorRMS = 0.0
+                    gpsSampleCount = 0
+                    visionGpsDriftFrames = 0
                 }
                 }
                 .onAppear {
@@ -503,10 +637,36 @@ struct CameraScreen: View {
                     cameraManager.targetFPS = 30.0
                     cameraManager.resolution = use4K ? .uhd4K : .hd1080
                     
+                    // Provide rig coordinate lookup for distance sanity on center calibration
+                    gpsTracker.rigCoordinateProvider = {
+                        rigLocationManager.rigCalibratedCoord ?? rigLocationManager.rigLocation?.coordinate
+                    }
+
+                    // Trigger an immediate tracking tick when fresh GPS arrives
+                    gpsTracker.onLocationUpdate = {
+                        switch trackingMode {
+                        case .watchGPS:
+                            tickTracking()
+                        case .gpsAI:
+                            if isTrackingActive {
+                                tickTracking()
+                            }
+                        default:
+                            break
+                        }
+                    }
+                    // Handle rig calibration arriving from Watch
+                    gpsTracker.onRigCalibrationFromWatch = { coord, samples, avgAcc in
+                        rigLocationManager.applyRigCalibrationFromWatch(coord: coord, samples: samples, avgAccuracy: avgAcc)
+                    }
+                    
                     restartTrackingTimer()
                 }
                 .onDisappear {
                     stopTrackingTimer()
+                    gpsTracker.onLocationUpdate = nil
+                    gpsTracker.rigCoordinateProvider = nil
+                    gpsTracker.onRigCalibrationFromWatch = nil
                 }
             .onChange(of: rigLocationManager.rigCalibratedCoord?.latitude) { _, _ in
                 recomputeCalibratedBearing()
@@ -534,7 +694,7 @@ struct CameraScreen: View {
         }
         
         // Start tracking timer
-        trackingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+        trackingTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
             tickTracking()
         }
         
@@ -552,6 +712,28 @@ struct CameraScreen: View {
     // MARK: - Tracking dispatch
 
     private func tickTracking() {
+        guard trackingMode != .off else { return }
+        
+        // Check if we have a vision target
+        let hasVisionTarget = (faceTracker.faceCenter != nil)
+        
+        // Update distance + motion state (GPS pipeline)
+        updateDistanceAndMotionIfPossible()
+        
+        // Distance-based auto zoom (no-op unless autoDistance enabled)
+        zoomController.updateZoomForDistance(
+            distanceMeters: viewModel.gpsDistanceMeters,
+            gpsTrust: gpsTrust,
+            hasGoodGPS: viewModel.gpsDistanceIsValid,
+            cameraManager: cameraManager
+        )
+        
+        // Update high-level track state (only for AI modes)
+        if trackingMode == .cameraAI || trackingMode == .gpsAI {
+            updateTrackState(hasVisionTarget: hasVisionTarget)
+        }
+        
+        // Dispatch to appropriate tracking method
         switch trackingMode {
         case .off:
             return
@@ -564,90 +746,553 @@ struct CameraScreen: View {
         }
     }
     
+    // MARK: - Tracking State Machine
+    
+    /// Update the tracking state based on vision detection
+    private func updateTrackState(hasVisionTarget: Bool) {
+        switch trackState {
+        case .searching:
+            if hasVisionTarget {
+                consecutiveLockFrames += 1
+                consecutiveLostFrames = 0
+                
+                if consecutiveLockFrames >= lockFramesThreshold {
+                    trackState = .locked
+                    print("🔒 Entering LOCKED state")
+                }
+            } else {
+                consecutiveLockFrames = 0
+                consecutiveLostFrames += 1
+                // We can stay in .searching indefinitely here
+            }
+            
+        case .locked:
+            if hasVisionTarget {
+                // Keep lock solid
+                consecutiveLostFrames = 0
+            } else {
+                consecutiveLostFrames += 1
+                
+                if consecutiveLostFrames >= lostFramesThreshold {
+                    trackState = .lost
+                    consecutiveLockFrames = 0
+                    print("❗️ Lost target – entering LOST state")
+                }
+            }
+            
+        case .lost:
+            if hasVisionTarget {
+                // Found someone again – go back to searching first
+                // then quickly promote to locked if continuity is good
+                trackState = .searching
+                consecutiveLockFrames = 1
+                consecutiveLostFrames = 0
+                print("🔍 Vision reacquired – back to SEARCHING")
+            } else {
+                // Still lost – GPS will drive the search
+                consecutiveLostFrames += 1
+            }
+        }
+    }
+    
+    // MARK: - Derived GPS Trust Score (0 = trash, 1 = very reliable)
+    
+    /// Computed GPS trust score based on alignment between GPS predictions and Vision detections
+    /// Returns 0.0 if not enough samples, otherwise 0.0-1.0 where 1.0 = perfect alignment
+    private var gpsTrust: CGFloat {
+        // Not enough data yet → no trust
+        guard gpsSampleCount >= gpsMinSamplesForTrust else { return 0.0 }
+        
+        // Error component: 1 when error ≈ 0, goes toward 0 as RMS error grows
+        // gpsErrorRMS is in normalized screen units [0..1] where 0.5 = half screen width
+        let normalizedError = gpsErrorRMS / gpsMaxScreenErrorForTrust
+        let errorComponent = max(0.0, 1.0 - normalizedError)  // clamp to [0, 1]
+        
+        // You can incorporate more components later (e.g., GPS accuracy, latency).
+        // For now, gpsTrust == errorComponent
+        return errorComponent
+    }
+    
+    // MARK: - GPS Quality Metrics Updater
+    
+    /// Call this when we have BOTH a reliable Vision center and a GPS-predicted expectedX.
+    /// This updates:
+    ///  - gpsBias: average (gpsX - visionX)
+    ///  - gpsErrorRMS: RMS error magnitude
+    ///  - gpsSampleCount: number of samples
+    ///
+    /// NOTE: This is telemetry-only. It does NOT change any tracking behavior yet.
+    private func updateGPSQualityMetrics(faceCenter: CGPoint, expectedX: CGFloat) {
+        // Vision X and GPS X are both 0..1 in screen space (left→right).
+        let visionX = faceCenter.x
+        let gpsX = expectedX
+        
+        // Signed error: positive means GPS thinks target is more to the right than Vision.
+        let error = gpsX - visionX
+        
+        // Convert to CGFloat (already is) and absolute error magnitude.
+        let absError = abs(error)
+        
+        // Exponential moving average update for bias and RMS.
+        //
+        // gpsEMAAlpha controls how quickly we adapt:
+        //   - small alpha (~0.05) = smoother, slower adaptation
+        //   - large alpha (~0.2)  = more reactive, but noisier
+        let alpha = gpsEMAAlpha
+        let oneMinusAlpha = 1.0 - alpha
+        
+        // Update running bias (signed)
+        gpsBias = oneMinusAlpha * gpsBias + alpha * error
+        
+        // Update running RMS error:
+        // We approximate RMS with EMA of squared error, then take sqrt.
+        let prevRMS = gpsErrorRMS
+        let prevVarApprox = prevRMS * prevRMS
+        let newVarApprox = oneMinusAlpha * prevVarApprox + alpha * (absError * absError)
+        gpsErrorRMS = sqrt(newVarApprox)
+        
+        // Increment sample count (used to gate trust at low sample counts)
+        gpsSampleCount += 1
+        
+        // Optional: debug log (you can comment this out later when stable)
+        if gpsSampleCount % 30 == 0 { // log every ~30 samples to avoid spam
+            let biasStr = String(format: "%.3f", gpsBias)
+            let rmsStr  = String(format: "%.3f", gpsErrorRMS)
+            let trustStr = String(format: "%.2f", gpsTrust)
+            print("📡 GPS Quality – samples=\(gpsSampleCount) bias=\(biasStr) rms=\(rmsStr) trust=\(trustStr)")
+        }
+    }
+    
+    // MARK: - GPS Reliability Helper
+    
+    /// Returns true when GPS is fresh and aligns reasonably with Vision over time.
+    private func hasGoodGPS() -> Bool {
+        // Basic freshness check from your Watch tracker
+        guard gpsTracker.isReceiving else { return false }
+        
+        // If you have gpsTrust from the telemetry section, use it:
+        // (0 = trash, 1 = great; tweak 0.5–0.7 as needed)
+        if gpsSampleCount >= gpsMinSamplesForTrust {
+            return gpsTrust > 0.6
+        }
+        
+        // Early in a session, before we have enough samples, just trust "freshness".
+        return true
+    }
+    
     // MARK: - Camera AI tracking (Vision-based)
     
     private func trackWithCameraAI() {
-        guard let face = faceTracker.faceCenter else { return }
-
-        // use mirroredX for flipped preview
-        let mirroredX = 1 - face.x
-        let offset = (mirroredX - 0.5) * 2.0   // -1..+1
-
-        let deadband: CGFloat = 0.10
-        if abs(offset) < deadband { return }
-
-        let gain: Double = 8
-        let maxStep: Double = 4
-
-        // Fixed: Removed negative sign - face on left (offset < 0) should move servo left (decrease angle)
-        let rawStep = Double(offset) * gain
-        let step = max(-maxStep, min(maxStep, rawStep))
-
-        let newAngle = max(0, min(180, api.currentAngle + step))
-        api.track(angle: Int(newAngle))
+        guard let faceCenter = faceTracker.faceCenter else {
+            smoothedSubjectWidth = nil
+            return
+        }
+        
+        // 1) Horizontal tracking (existing behavior)
+        applyVisionFollower(from: faceCenter)
+        
+        // 2) Compute & smooth subject width
+        if let bbox = faceTracker.targetBoundingBox {
+            let rawWidth = bbox.width    // 0..1 normalized width
+            let alpha: CGFloat = 0.4
+            if let prev = smoothedSubjectWidth {
+                smoothedSubjectWidth = prev * (1 - alpha) + rawWidth * alpha
+            } else {
+                smoothedSubjectWidth = rawWidth
+            }
+            subjectWidthFrameCounter &+= 1
+            if subjectWidthFrameCounter % 30 == 0, let w = smoothedSubjectWidth {
+                print("🔍 Subject width (smoothed): \(String(format: \"%.3f\", w))")
+            }
+        } else {
+            smoothedSubjectWidth = nil
+        }
+        
+        // 3) Auto zoom based on subject width (Vision-driven)
+        if let width = smoothedSubjectWidth,
+           let zoomController = zoomController {
+            zoomController.updateZoomForSubjectWidth(
+                normalizedWidth: width,
+                cameraManager: cameraManager
+            )
+        }
     }
     
     // MARK: - Watch GPS tracking
     
     private func trackWithWatchGPS() {
-        // Don't track if GPS data is stale
+        // 1) Ensure fresh GPS
         guard gpsTracker.isReceiving else { return }
-        
-        guard let targetAngle = servoAngleForCurrentGPS() else { return }
 
-        // Smooth servo movement to prevent jerking
-        let current = api.currentAngle
-        let diff = targetAngle - current
-        
-        // Adaptive step size based on distance
-        // Larger steps for bigger differences, smaller steps for fine-tuning
-        let maxStepPerTick: Double
-        if abs(diff) > 30 {
-            maxStepPerTick = 8  // Fast catch-up for large movements
-        } else if abs(diff) > 10 {
-            maxStepPerTick = 5  // Medium speed
-        } else {
-            maxStepPerTick = 3  // Slow for precision
-        }
+        // 2) Update distance + motion state from latest locations
+        updateDistanceAndMotionIfPossible()
 
-        // Ignore very tiny differences (deadband)
-        if abs(diff) < 0.5 { return }
+        // 3) Distance/speed-aware servo update toward filtered bearing
+        tickGPSServoWithDistanceAndMotion()
 
-        let step = max(-maxStepPerTick, min(maxStepPerTick, diff))
-        let newAngle = current + step
-
-        api.track(angle: Int(newAngle))
+        // (Optional) expose gpsDistanceMeters / gpsSpeedMps to UI if desired
     }
     
     // MARK: - GPS+AI Fusion Tracking
     
     private func trackWithGPSAIFusion() {
-        // Step 1: Compute expected screen X from GPS
-        let expectedX = computeExpectedXFromGPS()
-        gpsExpectedX = expectedX
-        faceTracker.expectedX = expectedX
+        let hasVisionTarget = (faceTracker.faceCenter != nil)
         
-        // Step 2: Check if Vision found a target
-        let hasVisionTarget = faceTracker.faceCenter != nil
-        
-        if let expX = expectedX {
-            // GPS says target should be in FOV
+        switch trackState {
+        case .searching:
+            gpsAiSearchingTick(hasVisionTarget: hasVisionTarget)
             
-            if hasVisionTarget {
-                // ✅ Vision found someone - track with AI (GPS-gated selection already applied)
-                trackWithCameraAI()
-            } else {
-                // ⚠️ GPS says in-frame but Vision can't see them
-                // Gently pan toward where GPS says they should be
-                panTowardExpectedX(expX)
+        case .locked:
+            gpsAiLockedTick(hasVisionTarget: hasVisionTarget)
+            
+        case .lost:
+            gpsAiLostTick(hasVisionTarget: hasVisionTarget)
+        }
+    }
+    
+    // MARK: - GPS+AI State-Specific Tracking
+    
+    /// SEARCHING state: GPS drives, Vision used only when aligned with GPS
+    private func gpsAiSearchingTick(hasVisionTarget: Bool) {
+        // Existing fusion behavior for expectedX / gating / vision checks
+        runExistingGPSAIBehavior()
+        
+        // Update distance + motion state from latest GPS
+        updateDistanceAndMotionIfPossible()
+        
+        // GPS drives the rig in searching when needed
+        tickGPSServoWithDistanceAndMotion()
+    }
+    
+    /// Locked state: Vision has full control - GPS does NOT move the servo,
+    /// but we watch for long-term disagreement vs GPS and can drop lock.
+    private func gpsAiLockedTick(hasVisionTarget: Bool) {
+        guard hasVisionTarget, let faceCenter = faceTracker.faceCenter else {
+            // No vision this frame; state machine will eventually move us to .lost
+            return
+        }
+        
+        // 1) Update GPS telemetry if we have an expectedX
+        if let expectedX = gpsExpectedX {
+            updateGPSQualityMetrics(faceCenter: faceCenter, expectedX: expectedX)
+        }
+        
+        // 2) Vision-only servo control (same as AI mode)
+        applyVisionFollower(from: faceCenter)
+        
+        // 3) Drift fail-safe: only if GPS is considered good and we have expectedX
+        guard hasGoodGPS(), let gx = gpsExpectedX else {
+            visionGpsDriftFrames = 0
+            return
+        }
+        
+        let fx = faceCenter.x
+        let diff = abs(fx - gx)   // 0..1 normalized screen units
+        
+        if diff > visionGpsDriftThreshold {
+            visionGpsDriftFrames += 1
+            if visionGpsDriftFrames >= visionGpsDriftFrameLimit {
+                // We've been disagreeing badly for too long → drop Vision lock
+                print("⚠️ GPS+AI: Vision/GPS drift too high for too long → dropping LOCKED → SEARCHING")
+                trackState = .searching
+                consecutiveLockFrames = 0
+                consecutiveLostFrames = 0
+                visionGpsDriftFrames = 0
             }
         } else {
-            // GPS says target is outside FOV
-            // Use pure GPS tracking to rotate toward them
-            if gpsTracker.isReceiving {
+            // Back in a reasonable band → reset drift counter
+            visionGpsDriftFrames = 0
+        }
+    }
+    
+    /// LOST state: same behavior as SEARCHING (GPS tries to reacquire)
+    private func gpsAiLostTick(hasVisionTarget: Bool) {
+        // Existing fusion behavior for expectedX / gating / vision checks
+        runExistingGPSAIBehavior()
+        
+        // Update distance + motion state from latest GPS
+        updateDistanceAndMotionIfPossible()
+        
+        // GPS-driven recovery in lost state
+        tickGPSServoWithDistanceAndMotion()
+    }
+    
+    // MARK: - Helper: GPS-first behavior for SEARCHING / LOST
+    
+    /// In .gpsAI mode while in .searching or .lost:
+    /// - If GPS is good → servo driven by GPS only
+    /// - If Vision sees someone aligned with GPS → Vision takes over
+    /// - If GPS is bad → fall back to Vision if available
+    private func runExistingGPSAIBehavior() {
+        // 1) Compute GPS-predicted expectedX in screen space (0..1) if in FOV
+        let expectedX = computeExpectedXFromGPS()
+        gpsExpectedX = expectedX
+        faceTracker.expectedX = expectedX  // keeps your GPS-gating behavior intact
+        
+        let goodGPS    = hasGoodGPS()
+        let hasVision  = (faceTracker.faceCenter != nil)
+        
+        // 2) If GPS is not usable, just fall back to Vision if we have it.
+        guard goodGPS else {
+            if hasVision {
+                trackWithCameraAI()
+            }
+            return
+        }
+        
+        // From here on, GPS is "good"
+        
+        // 3) If we have both GPS expectedX (in FOV) AND a Vision target:
+        if let gx = expectedX, let fx = faceTracker.faceCenter?.x {
+            let diff = abs(fx - gx)
+            if diff < visionGpsMatchThreshold {
+                // ✅ Vision + GPS agree → let Vision servo take over.
+                // State machine will promote us to .locked after enough frames.
+                trackWithCameraAI()
+                return
+            } else {
+                // Vision sees someone but not aligned with GPS yet.
+                // Treat GPS as the source of truth while searching.
                 trackWithWatchGPS()
+                return
             }
         }
+        
+        // 4) GPS is good but either:
+        //    - no Vision target, or
+        //    - GPS says outside FOV (expectedX == nil)
+        // In both cases, we just use GPS-only.
+        trackWithWatchGPS()
+    }
+    
+    // MARK: - Vision Follower (Shared Logic)
+    
+    /// Shared vision-based servo control used by both AI mode and GPS+AI locked state
+    /// Ensures coordinate consistency across all Vision tracking modes
+    /// Shared vision-based servo control used by both AI mode and GPS+AI locked state
+    /// Adding a small center bias lets us nudge the "true center" a couple degrees.
+    private func applyVisionFollower(from faceCenter: CGPoint) {
+        // Vision coordinates: 0..1, left→right
+        let x = faceCenter.x
+        
+        // --- Center bias logic ---
+        // Base mechanical bias
+        let gain: CGFloat = 10.0                // slightly higher gain for quicker corrections
+        let baseBiasDegrees: CGFloat = centerBiasDegrees
+        // Per-lens tweak (persisted)
+        let lensBiasDegrees: CGFloat = zoomController.currentPreset.lensCenterBiasDegrees
+        let totalBiasDegrees = baseBiasDegrees + lensBiasDegrees
+        let centerBiasNorm = totalBiasDegrees / gain
+        // Apply bias in normalized screen-space BEFORE computing offset:
+        //  - If bias > 0, this effectively shifts the "zero offset" point.
+        let offset = (x + centerBiasNorm) - 0.5    // -0.5..+0.5 around biased center
+        print("📐 center bias preset=\(zoomController.currentPreset.displayName) base=\(baseBiasDegrees) lens=\(lensBiasDegrees) total=\(totalBiasDegrees)")
+        // -------------------------
+        
+        // Deadband: tighter deadband → reacts sooner
+        let deadband: CGFloat = 0.03              // was 0.02, now 0.03 for more responsive tracking
+        if abs(offset) < deadband { return }
+
+        // Convert normalized offset to degrees
+        var step = offset * gain * servoMirror                  // degrees left/right
+        
+        // Clamp per-tick step size
+        let maxStep: CGFloat = 4.0
+        if step > maxStep { step = maxStep }
+        if step < -maxStep { step = -maxStep }
+        
+        // Apply to servo with safe clamping
+        let currentAngle = CGFloat(api.currentAngle)
+        let newAngle = clampAngle(currentAngle + step)  // 15°–165° in your helpers
+        sendServoAngle(Int(newAngle))
+    }
+    
+
+    // MARK: - Distance + Motion Update
+    private func updateDistanceAndMotionIfPossible() {
+        guard
+            let rigCoord = rigLocationManager.rigCalibratedCoord ?? rigLocationManager.rigLocation?.coordinate,
+            let watchLocation = gpsTracker.smoothedLocation
+        else {
+            return
+        }
+        
+        // 1. Compute distance from rig → watch
+        let rigLoc = CLLocation(latitude: rigCoord.latitude, longitude: rigCoord.longitude)
+        let distance = rigLoc.distance(from: watchLocation)   // meters
+        gpsDistanceMeters = distance
+        let accuracy = watchLocation.horizontalAccuracy
+        let isValid = accuracy > 0 && accuracy <= 3.0 && gpsTracker.isReceiving
+        viewModel.gpsDistanceMeters = distance
+        viewModel.gpsDistanceIsValid = isValid
+        viewModel.latestWatchAccuracy = accuracy
+        
+        // 2. Compute bearing rig → watch (instant)
+        let bearingRW = bearing(from: rigCoord, to: watchLocation.coordinate) // uses GPSHelpers
+        gpsBearingRigToWatch = bearingRW
+        
+        // 3. Compute speed & motion heading from last watch position
+        if let prev = lastSmoothedWatchLocation {
+            let dt = max(watchLocation.timestamp.timeIntervalSince(prev.timestamp), 0.1)
+            let segmentDist = prev.distance(from: watchLocation) // meters
+            let speed = segmentDist / dt                         // m/s
+            gpsSpeedMps = speed
+            
+            if segmentDist > 0.5 { // ignore tiny jitter
+                let motionH = bearing(from: prev.coordinate, to: watchLocation.coordinate)
+                gpsMotionHeading = motionH
+            }
+        } else {
+            gpsSpeedMps = 0
+            gpsMotionHeading = nil
+        }
+        
+        lastSmoothedWatchLocation = watchLocation
+        
+        // 4. Update smoothed / filtered bearing used for servo
+        updateFilteredBearing(withInstantBearing: bearingRW)
+    }
+
+
+    // MARK: - Bearing Filtering
+
+    /// Shortest signed angle difference (degrees) from `from` → `to`, in [-180, +180]
+    private func shortestSignedAngle(from: Double, to: Double) -> Double {
+        var delta = to - from
+        if delta > 180 { delta -= 360 }
+        if delta < -180 { delta += 360 }
+        return delta
+    }
+
+    private func updateFilteredBearing(withInstantBearing instant: Double) {
+        // If we don't have a previous filtered bearing, just start there.
+        guard let prevFiltered = gpsFilteredBearing else {
+            gpsFilteredBearing = instant
+            return
+        }
+        
+        let d = gpsDistanceMeters
+        let v = gpsSpeedMps
+        
+        // Base smoothing factor: how much we move toward the new bearing per update.
+        var alpha: Double = 0.12  // slightly slower base
+        
+        // Distance-dependent adjustment
+        switch d {
+        case ..<20:
+            alpha *= 0.5  // 0.075
+        case 20..<70:
+            alpha *= 1.0  // 0.15
+        default:
+            alpha *= 1.4  // ~0.21
+        }
+        
+        // Speed-dependent adjustment
+        if v < 0.5 {           // almost still
+            alpha *= 0.6
+        } else if v > 3.0 {    // paddling/flying
+            alpha *= 1.4
+        }
+        
+        // Clamp alpha to a tighter range to reduce twitch
+        alpha = min(max(alpha, 0.05), 0.25)
+        
+        // Smooth toward the instant bearing
+        let deltaToInstant = shortestSignedAngle(from: prevFiltered, to: instant)
+        let newBearingBase = prevFiltered + deltaToInstant * alpha
+        
+        // Optional: nudge toward motion heading if we have one and we're moving
+        var newBearing = newBearingBase
+        if let motionH = gpsMotionHeading, v > 0.8 {
+            let deltaToMotion = shortestSignedAngle(from: newBearingBase, to: motionH)
+            let motionInfluence: Double
+            switch d {
+            case ..<20:
+                motionInfluence = 0.04
+            case 20..<70:
+                motionInfluence = 0.10
+            default:
+                motionInfluence = 0.14
+            }
+            newBearing = newBearingBase + deltaToMotion * motionInfluence
+        }
+        
+        // Normalize to [0, 360)
+        var normalized = newBearing
+        while normalized < 0   { normalized += 360 }
+        while normalized >= 360 { normalized -= 360 }
+        
+        gpsFilteredBearing = normalized
+    }
+
+    // MARK: - Distance/Speech-aware Servo Parameters
+
+    private func servoDeadbandDegrees(forDistance d: Double) -> Double {
+        switch d {
+        case ..<20:
+            return 2.5    // don't twitch when surfer is close
+        case 20..<70:
+            return 1.5
+        default:
+            return 1.0
+        }
+    }
+    
+    private func servoMaxStepDegrees(forDistance d: Double, speed v: Double) -> Double {
+        var base: Double
+        switch d {
+        case ..<20:
+            base = 1.5
+        case 20..<70:
+            base = 2.5
+        default:
+            base = 3.5
+        }
+        
+        if v < 0.5 {
+            base *= 0.6     // very gentle if basically still
+        } else if v > 3.0 {
+            base *= 1.2     // slightly more aggressive if they're moving fast
+        }
+        
+        return min(max(base, 1.0), 6.0)
+    }
+    
+    // MARK: - Improved GPS Servo Control
+    
+    /// Convert a (bearing from rig) into a "target" servo angle in [0, 180],
+    /// using calibratedBearing as center mapping to 90°.
+    private func servoTargetAngle(forBearing bearing: Double, calibrated center: Double) -> Double {
+        var delta = bearing - center
+        if delta > 180 { delta -= 360 }
+        if delta < -180 { delta += 360 }
+        
+        let clamped = max(-90.0, min(90.0, delta))
+        return (clamped + 90.0)
+    }
+    
+    /// Distance + motion aware GPS servo update.
+    /// Call this in watchGPS mode and GPS-driven portions of gpsAI (searching/lost).
+    private func tickGPSServoWithDistanceAndMotion() {
+        // GPS-driven servo path is currently disabled (archived for rework).
+        // We still collect GPS distance/motion/filtered bearing, but do not move the servo here.
+        return
+    }
+
+    // MARK: - Servo Control Helpers
+    
+    /// Clamp servo angle to valid range (15°-165° to avoid physical limits)
+    private func clampAngle(_ angle: CGFloat) -> CGFloat {
+        let minAngle: CGFloat = 15.0
+        let maxAngle: CGFloat = 165.0
+        return max(minAngle, min(maxAngle, angle))
+    }
+    
+    /// Send servo angle command and update tracked angle
+    private func sendServoAngle(_ angle: Int) {
+        // Use existing PanRigAPI.track(angle:)
+        api.track(angle: angle)
+        // Note: api.currentAngle is @Published and will update automatically
     }
     
     /// Compute where GPS says the target should appear on screen (0..1)
@@ -695,8 +1340,8 @@ struct CameraScreen: View {
         let rawStep = Double(offset) * gain
         let step = max(-maxStep, min(maxStep, rawStep))
         
-        let newAngle = max(0, min(180, api.currentAngle + step))
-        api.track(angle: Int(newAngle))
+        let newAngle = clampAngle(CGFloat(api.currentAngle) + CGFloat(step))
+        sendServoAngle(Int(newAngle))
     }
     
     private func servoAngleForCurrentGPS() -> Double? {
@@ -713,7 +1358,7 @@ struct CameraScreen: View {
         let currentBearing = bearing(from: rig, to: watch) // 0..360
 
         // Relative angle from "forward" in range -180..+180
-        var delta = currentBearing - forward
+        var delta = forward - currentBearing
         if delta > 180 { delta -= 360 }
         if delta < -180 { delta += 360 }
 
@@ -747,6 +1392,34 @@ struct CameraScreen: View {
         print("✅ Calibrated bearing = \(brg)° (rig → watch center)")
     }
     
+    // MARK: - Zoom Buttons
+    
+    private var zoomButtons: some View {
+        HStack(spacing: 8) {
+            ForEach(ZoomPreset.allCases) { preset in
+                Button {
+                    zoomController.applyPreset(preset)
+                } label: {
+                    Text(preset.displayName)
+                        .font(.caption.bold())
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            zoomController.currentPreset == preset
+                            ? Color.white.opacity(0.9)
+                            : Color.black.opacity(0.4)
+                        )
+                        .foregroundColor(
+                            zoomController.currentPreset == preset
+                            ? .black
+                            : .white
+                        )
+                        .cornerRadius(12)
+                }
+            }
+        }
+    }
+    
     // MARK: - Recording Helpers
     
     /// Format duration as MM:SS
@@ -762,6 +1435,52 @@ struct CameraScreen: View {
             return abs(current - CGFloat(zoom)) < 0.1
         }
         return abs(zoomController.zoomFactor - CGFloat(zoom)) < 0.1
+    }
+
+    // MARK: - Auto Zoom Toggle
+    private var autoZoomButton: some View {
+        Button(action: {
+            if case .autoSubjectWidth = zoomController.mode {
+                zoomController.mode = .fixed(zoomController.zoomFactor)
+            } else {
+                zoomController.mode = .autoSubjectWidth
+            }
+        }) {
+            Text("Auto Zoom")
+                .font(.system(size: 14, weight: .semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    (zoomController.mode == .autoSubjectWidth)
+                    ? Color.green.opacity(0.85)
+                    : Color.black.opacity(0.6)
+                )
+                .foregroundColor(.white)
+                .clipShape(Capsule())
+        }
+    }
+
+    // MARK: - Distance Debug
+    private var distanceDebugText: String {
+        guard
+            let d = viewModel.gpsDistanceMeters,
+            viewModel.gpsDistanceIsValid
+        else {
+            return "Distance: -- m"
+        }
+        let feet = d * 3.28084
+        return String(format: "Distance: %.0f m (%.0f ft)", d, feet)
+    }
+
+    private var distanceDebugLabel: some View {
+        Text(distanceDebugText)
+            .font(.system(size: 14, weight: .semibold, design: .monospaced))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .foregroundColor(.white)
+            .background(Color.black.opacity(0.6))
+            .clipShape(Capsule())
+            .padding(.top, 10)
     }
 }
 

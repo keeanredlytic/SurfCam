@@ -294,64 +294,83 @@ final class ZoomController: ObservableObject {
         return false
     }
 
-        // MARK: - Vision-driven subject-width auto zoom (baseline-aware)
-    /// Adjusts zoom based on the normalized width (0..1) of the tracked subject vs baseline.
+        // MARK: - Vision-driven subject-width auto zoom
+    /// Adjusts zoom so the tracked subject stays ~6% of the frame width,
+    /// with a ±1% dead zone (0.05–0.07 normalized width).
     func updateZoomForSubjectWidth(
         normalizedWidth: CGFloat?,
-        baselineWidth: CGFloat?,
+        baselineWidth: CGFloat?,           // now unused; kept for signature compatibility
         cameraManager: CameraSessionManager
     ) {
         guard case .autoSubjectWidth = mode else { return }
-        guard let width = normalizedWidth,
-              let baseline = baselineWidth,
-              width > 0.01 else { return }
 
-        // Ratio vs baseline
-        let ratio = width / baseline
+        guard let width = normalizedWidth, width > 0.0 else { return }
 
-        // Dead zone (±20%)
-        let innerMin: CGFloat = 0.8
-        let innerMax: CGFloat = 1.2
+        // 🎯 Target surfer width = 6% of frame
+        let targetWidth: CGFloat = 0.06
 
-        // Outer bands (more aggressive)
-        let outerMin: CGFloat = 0.6
-        let outerMax: CGFloat = 1.6
+        // Deadzone: no zoom change if surfer width is within [5%, 7%]
+        let innerTolerance: CGFloat = 0.01   // ±1%
 
-        // Persistence based on ratio
-        if ratio < innerMin {
-            narrowFrames &+= 1
-            wideFrames = 0
-        } else if ratio > innerMax {
-            wideFrames &+= 1
-            narrowFrames = 0
+        // Outer band: more aggressive response if > 2% away
+        let outerTolerance: CGFloat = 0.02   // ±2%
+
+        let diff = width - targetWidth      // >0 => too big, <0 => too small
+        let absDiff = abs(diff)
+
+        // --- Persistence: only act if outside inner band for a few frames ---
+        if absDiff > innerTolerance {
+            if diff < 0 {
+                // surfer too small
+                narrowFrames &+= 1
+                wideFrames = 0
+            } else {
+                // surfer too large
+                wideFrames &+= 1
+                narrowFrames = 0
+            }
         } else {
+            // In the sweet spot, reset counters and do nothing
             narrowFrames = 0
             wideFrames = 0
+            return
         }
+
         let minTriggerFrames = 5
+
+        if narrowFrames < minTriggerFrames && wideFrames < minTriggerFrames {
+            return
+        }
 
         let current = zoomFactor
         var targetZoom = current
 
-        if ratio < outerMin, narrowFrames >= minTriggerFrames {
-            let factor = min(1.6, max(1.1, 1.0 + (outerMin - ratio) * 1.5))
-            targetZoom = current * factor
-        } else if ratio < innerMin, narrowFrames >= minTriggerFrames {
-            targetZoom = current * 1.05
-        } else if ratio > outerMax, wideFrames >= minTriggerFrames {
-            let factor = max(0.6, min(0.9, 1.0 - (ratio - outerMax) * 0.5))
-            targetZoom = current * factor
-        } else if ratio > innerMax, wideFrames >= minTriggerFrames {
-            targetZoom = current * 0.95
+        // --- Compute how hard to correct, based on how far we are from target ---
+        // Normalized 0..1 "error magnitude" beyond the inner tolerance.
+        let excess = max(0.0, absDiff - innerTolerance)
+        let normError = min(1.0, excess / outerTolerance) // 0 when barely out of band, 1 when way out
+
+        // Base step size in zoom units per adjustment
+        let maxStep: CGFloat = 0.25   // maximum zoom change we *aim* for before smoothing
+        let minStep: CGFloat = 0.05   // minimum noticeable correction
+
+        // Interpolate step between minStep and maxStep based on how far off we are
+        let stepMagnitude = minStep + (maxStep - minStep) * normError
+
+        if diff < 0 {
+            // surfer too small → zoom in
+            targetZoom = current + stepMagnitude
         } else {
-            return
+            // surfer too large → zoom out
+            targetZoom = current - stepMagnitude
         }
 
+        // Clamp logical zoom range – this is the hard boundary for auto zoom
         let minFactor: CGFloat = 0.5
-        let maxFactor: CGFloat = 24.0    // allow full 24x when necessary
+        let maxFactor: CGFloat = 8.0   // ✅ new cap at 8x
         targetZoom = max(minFactor, min(maxFactor, targetZoom))
 
-        // Zoom-aware smoothing
+        // --- Smoothing: keep your existing zoom-easing logic ---
         let alpha: CGFloat = 0.25
         var newZoom = current + alpha * (targetZoom - current)
 

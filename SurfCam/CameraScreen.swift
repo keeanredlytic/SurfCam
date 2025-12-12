@@ -89,11 +89,10 @@ struct CameraScreen: View {
         let isWellCentered = horizontalOffset < 0.20
         guard isWellCentered else { return }
 
-        if let width = smoothedSubjectWidth,
-           let targetWidth = targetSubjectWidth {
+        if let width = smoothedSubjectWidth {
             zoomController.updateZoomForSubjectWidth(
                 normalizedWidth: width,
-                baselineWidth: targetWidth,
+                baselineWidth: nil,          // baseline is unused now
                 cameraManager: cameraManager
             )
         }
@@ -198,6 +197,10 @@ struct CameraScreen: View {
     @State private var framesSinceLastTarget: Int = 0
     /// How long we "trust" they'll pop back up (20 Hz tick => 60 ≈ 3.0s)
     private let passiveHoldFrames: Int = 60
+    
+    // MARK: - Manual override (prevents AI from fighting manual taps)
+    @State private var manualOverrideFrames: Int = 0
+    private let manualOverrideDurationFrames: Int = 10 // ~0.5s at 20Hz
     /// For restoring zoom behavior
     @State private var zoomModeBeforeHold: ZoomMode = .fixed(1.0)
     @State private var zoomBeforeHold: CGFloat?
@@ -286,14 +289,41 @@ struct CameraScreen: View {
                                 .frame(width: 18, height: 18)
                                 .position(x: xPos, y: yPos)
                         }
+                    
+                    // 🔵 Blue ring: color-locked / hard-lock position
+                    if faceTracker.isColorLockActive,
+                       let lockCenter = faceTracker.hardLockCenter {
+                        let mirroredX = 1 - lockCenter.x
+                        let xPos = mirroredX * width
+                        let yPos = (1 - lockCenter.y) * height
+                        
+                        Circle()
+                            .stroke(
+                                faceTracker.isUsingColorReacquire ? Color.cyan : Color.blue,
+                                lineWidth: 2
+                            )
+                            .frame(width: 22, height: 22)
+                                .position(x: xPos, y: yPos)
+                        }
                     }
                     .allowsHitTesting(false)
                 .ignoresSafeArea()
                 
                 // UI Controls overlay
-                VStack {
-                    // Top row: Recording indicator (left) + Resolution toggle + Status (right)
-                    HStack {
+                GeometryReader { geo in
+                    ZStack {
+                        // Top-left: Zoom + Mode
+                        VStack(alignment: .leading, spacing: 8) {
+                            zoomButtons
+                            modeButton
+                        }
+                        .padding(.top, 16)
+                        .padding(.leading, 16)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        
+                        // Top row: Recording indicator (left) + Resolution toggle + Status (right)
+                        VStack {
+                            HStack {
                         // Recording indicator
                         if cameraManager.isRecording {
                             HStack(spacing: 6) {
@@ -335,46 +365,23 @@ struct CameraScreen: View {
                         }
                         
                         Spacer()
-
-                        // Distance debug (center-ish in top row)
-                        distanceDebugLabel
-
-                        Spacer()
                         
                         // Status display with tracking indicator
-                        if trackingMode != .off {
+                    if trackingMode == .cameraAI {
                             HStack(spacing: 6) {
-                                // Tracking active indicator (green when tracking, yellow when paused)
-                                let isActive = (trackingMode == .cameraAI) || 
-                                               (trackingMode == .watchGPS) || 
-                                               (trackingMode == .gpsAI && isTrackingActive)
                                 Circle()
-                                    .fill(isActive ? Color.green : Color.yellow)
+                                    .fill(Color.green)
                                     .frame(width: 6, height: 6)
                                 
-                    if trackingMode == .cameraAI {
-                                    if faceTracker.faceCenter != nil {
-                                        Text("👤")
-                                            .font(.caption2)
-                        } else {
-                                        Text("—")
-                                            .font(.caption2)
-                                            .foregroundColor(.white.opacity(0.5))
-                        }
-                                } else if let watchLoc = gpsTracker.smoothedLocation {
-                                    Text(String(format: "±%.0fm", watchLoc.horizontalAccuracy))
+                                if faceTracker.faceCenter != nil {
+                                    Text("👤")
                                         .font(.caption2)
-                                        .foregroundColor(.white.opacity(0.8))
-                                    if trackingMode == .gpsAI && faceTracker.faceCenter != nil {
-                                        Text("👤")
-                                            .font(.caption2)
-                        }
-                    } else {
-                                    Text("GPS...")
+                        } else {
+                                    Text("—")
                                         .font(.caption2)
                                         .foregroundColor(.white.opacity(0.5))
-                    }
-                }
+                                }
+                            }
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
                             .background(Color.black.opacity(0.5))
@@ -384,59 +391,24 @@ struct CameraScreen: View {
                     .padding(.horizontal, sidePadding)
                     .padding(.top, isLandscape ? 8 : 12)
                     
+                    // Color lock debug HUD (top-right)
+                    HStack {
+                        Spacer()
+                        colorLockDebugHud
+                            .padding(.trailing, sidePadding)
+                            .padding(.top, isLandscape ? 8 : 12)
+                    }
+                    
                     Spacer()
                     
-                    // Bottom row: Zoom + Picker + Record button
+                    // Bottom row: Controls + Record button
                     HStack(alignment: .bottom, spacing: 12) {
-                        // Left side: Zoom controls
-                        zoomButtons
-                        
                         Spacer()
                         
                         VStack(spacing: 6) {
                             autoZoomButton
                             lockSubjectButton
                             subjectLockPill
-                        }
-                        
-                        Spacer()
-                        
-                        // Center: Mode picker + Start button for GPS+AI
-                        VStack(spacing: 8) {
-                            Picker("", selection: $trackingMode) {
-                        Text("Off").tag(TrackingMode.off)
-                        Text("AI").tag(TrackingMode.cameraAI)
-                        Text("GPS").tag(TrackingMode.watchGPS)
-                                Text("AI+").tag(TrackingMode.gpsAI)
-                    }
-                    .pickerStyle(.segmented)
-                            .frame(width: isLandscape ? 180 : 200)
-                            .scaleEffect(isLandscape ? 0.9 : 1.0)
-                            
-                            // Start Tracking button for GPS+AI mode
-                            if trackingMode == .gpsAI && calibratedBearing != nil {
-                                Button(action: {
-                                    isTrackingActive.toggle()
-                                    if isTrackingActive {
-                    restartTrackingTimer()
-                                    } else {
-                                        stopTrackingTimer()
-                                    }
-                                }) {
-                                    HStack(spacing: 6) {
-                                        Circle()
-                                            .fill(isTrackingActive ? Color.green : Color.gray)
-                                            .frame(width: 8, height: 8)
-                                        Text(isTrackingActive ? "Tracking" : "Start Tracking")
-                                            .font(.system(size: 12, weight: .semibold))
-                                    }
-                                    .foregroundColor(.white)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(isTrackingActive ? Color.green.opacity(0.3) : Color.blue.opacity(0.5))
-                                    .cornerRadius(6)
-                                }
-                            }
                         }
                         
                         Spacer()
@@ -697,6 +669,16 @@ struct CameraScreen: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                         .animation(.easeInOut(duration: 0.2), value: showSystemPanel)
                     }
+                    }
+                    .padding(.horizontal, sidePadding)
+                    .padding(.top, isLandscape ? 8 : 12)
+                    
+                    // Bottom-right: Manual pan/tilt control pad
+                    manualControlPad
+                        .padding(.trailing, 24)
+                        .padding(.bottom, 24)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                    }
                 }
                 .ignoresSafeArea(edges: .horizontal)
             }
@@ -854,13 +836,16 @@ struct CameraScreen: View {
         // Update distance + motion state (GPS pipeline)
         updateDistanceAndMotionIfPossible()
         
-        // Distance-based auto zoom (no-op unless autoDistance enabled)
-        zoomController.updateZoomForDistance(
-            distanceMeters: viewModel.gpsDistanceMeters,
-            gpsTrust: gpsTrust,
-            hasGoodGPS: viewModel.gpsDistanceIsValid,
-            cameraManager: cameraManager
-        )
+        // Distance-based auto zoom (only in GPS modes, not cameraAI)
+        // In cameraAI mode, zoom is only driven by the 6% width rule
+        if trackingMode == .watchGPS || trackingMode == .gpsAI {
+            zoomController.updateZoomForDistance(
+                distanceMeters: viewModel.gpsDistanceMeters,
+                gpsTrust: gpsTrust,
+                hasGoodGPS: viewModel.gpsDistanceIsValid,
+                cameraManager: cameraManager
+            )
+        }
         
         // Update high-level track state (only for AI modes)
         if trackingMode == .cameraAI || trackingMode == .gpsAI {
@@ -1019,6 +1004,16 @@ struct CameraScreen: View {
     private func trackWithCameraAI() {
         let hasTarget = (faceTracker.faceCenter != nil)
 
+        // If we recently nudged manually, let Vision "see" but don't move servos.
+        if manualOverrideFrames > 0 {
+            manualOverrideFrames &-= 1
+            // You can still update subjectWidth/auto-zoom if you want:
+            if hasTarget {
+                updateSubjectWidthAndAutoZoom()
+            }
+            return
+        }
+
         if hasTarget {
             framesSinceLastTarget = 0
 
@@ -1027,10 +1022,15 @@ struct CameraScreen: View {
                 handleReacquiredAfterPassiveHold()
             }
 
-            // Horizontal tracking (pan) and vertical framing (tilt)
+            // Pan-priority: try pan first, only allow tilt if pan didn't move
             if let faceCenter = faceTracker.faceCenter {
-                applyVisionFollower(from: faceCenter)
-                applyTiltFollower(from: faceCenter)
+                // 1) Try pan first
+                let didPanMove = applyVisionFollower(from: faceCenter)
+                
+                // 2) Only if pan did NOT move, allow tilt to adjust this tick
+                if !didPanMove {
+                    _ = applyTiltFollower(from: faceCenter)
+                }
             }
 
             // Subject width + auto zoom
@@ -1206,7 +1206,7 @@ struct CameraScreen: View {
     }
     
     // MARK: - Vision Follower (Shared Logic)
-    private func applyVisionFollower(from faceCenter: CGPoint) {
+    private func applyVisionFollower(from faceCenter: CGPoint) -> Bool {
         let x = faceCenter.x // 0..1
 
         // Current zoom factor (UI space)
@@ -1236,7 +1236,8 @@ struct CameraScreen: View {
         let offset = (x + centerBiasNorm) - 0.5
         print("📐 center bias preset=\(zoomController.currentPreset.displayName) base=\(baseBiasDegrees) lens=\(lensBiasDegrees) total=\(totalBiasDegrees)")
 
-        if abs(offset) < deadband { return }
+        // ❗️No move = return false
+        if abs(offset) < deadband { return false }
 
         var step = offset * gain * servoMirror
         step = max(-maxStep, min(maxStep, step))
@@ -1244,41 +1245,54 @@ struct CameraScreen: View {
         let currentAngle = CGFloat(api.currentPanAngle)
         let newAngle = clampAngle(currentAngle + step) // 15–165
         sendPanAngle(Int(newAngle))
+
+        return true
     }
 
     // MARK: - Tilt follower (vertical framing)
-    private func applyTiltFollower(from faceCenter: CGPoint) {
+    private func applyTiltFollower(from faceCenter: CGPoint) -> Bool {
         let y = faceCenter.y // 0..1, top → bottom
 
-        // Desired vertical position of surfer (slightly below center to keep more sky/horizon)
+        // We want the surfer slightly below center
         let desiredY: CGFloat = 0.55
 
+        // Zoom-aware control tuning – mirror of pan
         let zoom = zoomController.zoomFactor
         let zoomClamped = max(1.0, min(zoom, 8.0))
 
-        let baseGain: CGFloat = 80.0   // degrees of tilt per normalized offset
-        let baseDeadband: CGFloat = 0.02
-        let baseMaxStep: CGFloat = 5.0
+        let baseGain: CGFloat = 10.0      // 🔁 same as pan
+        let baseDeadband: CGFloat = 0.05  // 🔥 5% vertical no-move zone (larger than pan for natural bobbing)
+        let baseMaxStep: CGFloat = 4.0    // 🔁 same as pan (max degrees per tick)
 
-        // Slightly reduce gain at high zoom
         let gainScale = 1.0 / (1.0 + 0.25 * (zoomClamped - 1.0))
         let gain = baseGain * gainScale
-        let deadband = baseDeadband
-        let maxStep = baseMaxStep * gainScale
 
-        // Offset: positive means surfer is LOWER than desired
-        let offset = y - desiredY
-        if abs(offset) < deadband { return }
+        let deadbandScale = 1.0 + 0.5 * (zoomClamped - 1.0) / 7.0
+        let deadband: CGFloat = baseDeadband * deadbandScale
 
-        var step = offset * gain
+        let maxStep: CGFloat = baseMaxStep * gainScale
 
-        // Limit max step
-        step = max(-maxStep, min(maxStep, step))
+        // Offset: how far we are from desired vertical position
+        // y > desiredY means surfer is lower in the frame
+        var offset = y - desiredY
+
+        // If this moves the wrong way, just flip the sign:
+        // offset = desiredY - y
+
+        // ❗️No move = return false
+        if abs(offset) < deadband { return false }
+
+        // Direction scaling – flip to match your physical tilt orientation if needed
+        let tiltDirection: CGFloat = 1.0  // set to -1.0 if inverted
+
+        var step = offset * gain * tiltDirection
+        step = max(-maxStep, min(maxStep, step)) // clamp like pan
 
         let currentTilt = CGFloat(api.currentTiltAngle)
-        let newTilt = clampTiltAngle(currentTilt + step)
-
+        let newTilt = clampTiltAngle(currentTilt + step) // 80–180
         sendTiltAngle(Int(newTilt))
+
+        return true
     }
 
 // MARK: - Distance + Motion Update
@@ -1470,7 +1484,7 @@ struct CameraScreen: View {
         let zoom = zoomController.zoomFactor
         
         // Stronger smoothing at high zoom (slightly relaxed for responsiveness)
-        let alpha: CGFloat = zoom >= 6.0 ? 0.4 : 0.6  // 0.6 = snappier, 0.4 = smoother
+        let alpha: CGFloat = zoom >= 4.0 ? 0.55 : 0.7  // 70% weight at normal zoom, 55% at high zoom
         
         let smoothed: CGFloat
         if let last = lastCommandedPanAngle {
@@ -1491,10 +1505,13 @@ struct CameraScreen: View {
         return max(80, min(180, angle))
     }
 
-    /// Send tilt angle command (smoothing independent of zoom)
+    /// Send tilt angle command (zoom-aware smoothing to match pan)
     private func sendTiltAngle(_ angle: Int) {
         let raw = CGFloat(angle)
-        let alpha: CGFloat = 0.6 // relaxed, tilt doesn’t need zoom coupling
+        let zoom = zoomController.zoomFactor
+        
+        // 🔁 Match pan smoothing: more smoothing at high zoom
+        let alpha: CGFloat = zoom >= 4.0 ? 0.55 : 0.7  // 70% weight at normal zoom, 55% at high zoom
 
         let smoothed: CGFloat
         if let last = lastCommandedTiltAngle {
@@ -1507,6 +1524,81 @@ struct CameraScreen: View {
         lastCommandedTiltAngle = clamped
         api.trackTilt(angle: Int(clamped.rounded()))
         // Note: api.currentTiltAngle is @Published and will update automatically
+    }
+    
+    // MARK: - Immediate servo commands for manual controls
+    
+    private func sendPanAngleImmediate(_ angle: Int) {
+        let clamped = clampAngle(CGFloat(angle))
+        lastCommandedPanAngle = clamped  // keep smoothing in sync
+        api.trackPan(angle: Int(clamped.rounded()))
+    }
+    
+    private func sendTiltAngleImmediate(_ angle: Int) {
+        let clamped = clampTiltAngle(CGFloat(angle))
+        lastCommandedTiltAngle = clamped
+        api.trackTilt(angle: Int(clamped.rounded()))
+    }
+    
+    // MARK: - Manual nudge controls
+    
+    private let manualPanStep: CGFloat = 3.0     // degrees per tap
+    private let manualTiltStep: CGFloat = 3.0    // degrees per tap
+    
+    private func nudgePan(by delta: CGFloat) {
+        let current = CGFloat(api.currentPanAngle)
+        let newAngle = clampAngle(current + delta)    // still respects 15–165°
+        manualOverrideFrames = manualOverrideDurationFrames
+        sendPanAngleImmediate(Int(newAngle))
+    }
+    
+    private func nudgeTilt(by delta: CGFloat) {
+        let current = CGFloat(api.currentTiltAngle)
+        let newTilt = clampTiltAngle(current + delta) // still respects 80–180°
+        manualOverrideFrames = manualOverrideDurationFrames
+        sendTiltAngleImmediate(Int(newTilt))
+    }
+    
+    // MARK: - Manual control pad UI
+    
+    private var manualControlPad: some View {
+        VStack(spacing: 6) {
+            Button(action: {
+                nudgeTilt(by: -manualTiltStep)   // negative = tilt up (toward horizon)
+            }) {
+                Image(systemName: "chevron.up.circle.fill")
+                    .font(.system(size: 26, weight: .bold))
+            }
+            
+            HStack(spacing: 18) {
+                Button(action: {
+                    nudgePan(by: -manualPanStep)  // negative = pan left
+                }) {
+                    Image(systemName: "chevron.left.circle.fill")
+                        .font(.system(size: 26, weight: .bold))
+                }
+                
+                Button(action: {
+                    nudgePan(by: manualPanStep)   // positive = pan right
+                }) {
+                    Image(systemName: "chevron.right.circle.fill")
+                        .font(.system(size: 26, weight: .bold))
+                }
+            }
+            
+            Button(action: {
+                nudgeTilt(by: manualTiltStep)     // positive = tilt down (toward beach)
+            }) {
+                Image(systemName: "chevron.down.circle.fill")
+                    .font(.system(size: 26, weight: .bold))
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.black.opacity(0.35))
+        )
+        .foregroundColor(.white)
     }
     
     /// Compute where GPS says the target should appear on screen (0..1)
@@ -1631,6 +1723,15 @@ struct CameraScreen: View {
                         .cornerRadius(12)
                 }
             }
+            
+            // Live zoom readout (shows 5.3x, 7.9x, 8.0x, etc.)
+            Text(String(format: "%.1fx", zoomController.zoomFactor))
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.black.opacity(0.4))
+                .foregroundColor(.white)
+                .clipShape(Capsule())
         }
     }
     
@@ -1651,6 +1752,28 @@ struct CameraScreen: View {
         return abs(zoomController.zoomFactor - CGFloat(zoom)) < 0.1
     }
 
+    // MARK: - Mode Toggle
+    private var modeButton: some View {
+        Button(action: toggleTrackingMode) {
+            Text(trackingMode == .off ? "Tracking Off" : "Tracking On")
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.black.opacity(0.4))
+                .foregroundColor(.white)
+                .clipShape(Capsule())
+        }
+    }
+    
+    private func toggleTrackingMode() {
+        switch trackingMode {
+        case .off:
+            trackingMode = .cameraAI
+        default:
+            trackingMode = .off
+        }
+    }
+    
     // MARK: - Subject Lock UI
     private var lockSubjectButton: some View {
         Button(action: {
@@ -1724,6 +1847,33 @@ struct CameraScreen: View {
             .background(Color.black.opacity(0.6))
             .clipShape(Capsule())
             .padding(.top, 10)
+    }
+    
+    // Small HUD in the top-right showing the locked color swatch + RGB
+    private var colorLockDebugHud: some View {
+        Group {
+            if faceTracker.isColorLockActive,
+               let uiColor = faceTracker.lockedColorPreview {
+                HStack(spacing: 8) {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color(uiColor))
+                        .frame(width: 24, height: 24)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color.white.opacity(0.8), lineWidth: 1)
+                        )
+                    
+                    Text(faceTracker.lockedColorDebugText)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white)
+                }
+                .padding(6)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.black.opacity(0.45))
+                )
+            }
+        }
     }
 }
 

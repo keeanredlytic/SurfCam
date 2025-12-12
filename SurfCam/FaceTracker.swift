@@ -35,10 +35,34 @@ class FaceTracker: ObservableObject {
     @Published var shouldLockSubject: Bool = false
     var onSubjectSizeLocked: ((_ width: CGFloat, _ height: CGFloat) -> Void)?
 
+    // MARK: - Debug / UI helpers
+    
+    /// True when we currently have a color lock with meaningful strength.
+    @Published var isColorLockActive: Bool = false
+    
+    /// Normalized 0..1 center of the hard-locked subject (for blue debug dot).
+    /// This will track the chosen target while hard lock is active.
+    @Published var hardLockCenter: CGPoint?
+    
+    /// Preview color of the locked subject (for UI swatch).
+    @Published var lockedColorPreview: UIColor?
+    
+    /// Simple RGB debug text (0–255) for logging / overlay.
+    @Published var lockedColorDebugText: String = ""
+    
+    /// True when we are in the hard-lock grace window using color-heavy reacquire.
+    @Published var isUsingColorReacquire: Bool = false
+
     // Color/size lock state
     private var targetColor: SIMD3<Float>?
     private var targetColorStrength: Float = 0.0
     private var lastColorBox: CGRect?
+    
+    // Hard subject lock state
+    private var lockedTargetID: UUID?
+    private var isHardLocked: Bool = false
+    private var framesSinceLockedSeen: Int = 0
+    private let hardLockLostThreshold: Int = 20  // ~1s at 20 Hz (tune as needed)
 
     private let visionQueue = DispatchQueue(label: "FaceTracker.visionQueue")
     private var smoothedCenter: CGPoint? = nil
@@ -86,6 +110,11 @@ class FaceTracker: ObservableObject {
         currentTargetID = nil
         allDetections = []
         targetBoundingBox = nil
+        
+        // Reset hard lock state
+        isHardLocked = false
+        lockedTargetID = nil
+        framesSinceLockedSeen = 0
     }
 
     private var frameCount = 0
@@ -132,6 +161,7 @@ class FaceTracker: ObservableObject {
             }
             
             guard !detections.isEmpty else {
+                // Tracking-wise, we lost them this frame
                 DispatchQueue.main.async {
                     self.faceCenter = nil
                     self.smoothedCenter = nil
@@ -139,27 +169,83 @@ class FaceTracker: ObservableObject {
                     self.targetBoundingBox = nil
                     // Don't clear currentTargetID - keep it for when they reappear
                 }
+                
+                // Keep isHardLocked / isColorLockActive as-is;
+                // framesSinceLockedSeen should still be incremented in the outer logic.
                 return
             }
 
-            // Choose best detection using scoring
+            // Choose best detection using scoring (with hard lock support)
             let previous = self.smoothedCenter
-            let chosen: PersonDetection
-            
             let pixelBufferRef = pixelBuffer
-            if gpsGating, let expX = gpsExpectedX {
-                // GPS-gated selection: score each person (with color/size)
-                chosen = self.pickBestTarget(
-                    candidates: detections,
-                    expectedX: expX,
-                    previousCenter: previous,
-                    pixelBuffer: pixelBufferRef
-                )
+            let gpsExpectedXValue = gpsGating ? gpsExpectedX : nil
+            
+            var chosen: PersonDetection
+            
+            if isHardLocked, let lockedID = lockedTargetID {
+                // Try to find the locked target in this frame
+                if let lockedDetection = detections.first(where: { $0.id == lockedID }) {
+                    // ✅ Still seeing the locked subject – use it and ONLY it
+                    chosen = lockedDetection
+                    framesSinceLockedSeen = 0
+                    
+                    // 🔵 Debug: hard lock center tracks this subject
+                    DispatchQueue.main.async {
+                        self.hardLockCenter = CGPoint(x: lockedDetection.x, y: lockedDetection.y)
+                        self.isUsingColorReacquire = false
+                    }
+                } else {
+                    // 🚨 Locked subject not detected in this frame
+                    framesSinceLockedSeen &+= 1
+                    
+                    if framesSinceLockedSeen <= hardLockLostThreshold {
+                        // Grace window – we are in color-heavy reacquire mode
+                        DispatchQueue.main.async {
+                            self.isUsingColorReacquire = true
+                        }
+                        
+                        chosen = self.pickBestTarget(
+                            candidates: detections,
+                            expectedX: gpsExpectedXValue,
+                            previousCenter: nil,      // continuity is unreliable here
+                            pixelBuffer: pixelBufferRef
+                        )
+                        
+                        // 🔵 Debug: hardLockCenter moves with chosen reacquire target
+                        DispatchQueue.main.async {
+                            self.hardLockCenter = CGPoint(x: chosen.x, y: chosen.y)
+                        }
+                    } else {
+                        // Hard lock expires
+                        print("⚠️ Hard lock expired after \(framesSinceLockedSeen) frames without subject.")
+                        isHardLocked = false
+                        lockedTargetID = nil
+                        framesSinceLockedSeen = 0
+                        
+                        DispatchQueue.main.async {
+                            self.isUsingColorReacquire = false
+                            self.hardLockCenter = nil
+                            self.isColorLockActive = false
+                        }
+                        
+                        // Fallback to normal best-target behavior
+                        chosen = self.pickBestTarget(
+                            candidates: detections,
+                            expectedX: gpsExpectedXValue,
+                            previousCenter: previous,
+                            pixelBuffer: pixelBufferRef
+                        )
+                    }
+                }
             } else {
-                // No GPS: use scoring without GPS bias (expectedX nil)
+                // No hard lock – normal scoring-based choice
+                framesSinceLockedSeen = 0
+                DispatchQueue.main.async {
+                    self.isUsingColorReacquire = false
+                }
                 chosen = self.pickBestTarget(
                     candidates: detections,
-                    expectedX: nil,
+                    expectedX: gpsExpectedXValue,
                     previousCenter: previous,
                     pixelBuffer: pixelBufferRef
                 )
@@ -169,8 +255,8 @@ class FaceTracker: ObservableObject {
 
             // Low-pass filter to smooth jitter
             // Make X more reactive while keeping Y smoothing
-            let alphaX: CGFloat = 0.5   // more responsive horizontally
-            let alphaY: CGFloat = 0.3   // keep vertical smoothing
+            let alphaX: CGFloat = 0.7   // more weight on new data → snappier pan
+            let alphaY: CGFloat = 0.45  // slightly snappier tilt, still smooth-ish
             let newCenter: CGPoint
             if let prev = self.smoothedCenter {
                 newCenter = CGPoint(
@@ -273,18 +359,41 @@ class FaceTracker: ObservableObject {
         // Color score based on locked targetColor
         let colorScore = computeColorScore(for: person, pixelBuffer: pixelBuffer)
 
-        let wGPS: CGFloat   = 0.25
-        let wCont: CGFloat  = 0.30
-        let wSize: CGFloat  = 0.25
-        let wColor: CGFloat = 0.20
+        // Are we in a "reacquire" situation?
+        // i.e. we have a locked color, but no reliable previous center.
+        let hasPrevCenter = (previousCenter != nil)
+        let hasColorLock = (targetColor != nil && targetColorStrength > 0.1)
+        let isReacquiring = (!hasPrevCenter && hasColorLock)
 
+        // Weights for normal vs reacquire
+        let wGPS: CGFloat
+        let wCont: CGFloat
+        let wSize: CGFloat
+        let wColor: CGFloat
+
+        if isReacquiring {
+            // Reacquire mode: lean hard on color, less on continuity (since we have none)
+            wGPS  = 0.15   // still allow GPS gating a bit if present
+            wCont = 0.10   // continuity is mostly useless with no previous center
+            wSize = 0.30   // size still matters (closer person is likelier)
+            wColor = 0.45  // 🔥 make color the main signal to reacquire the same surfer
+        } else {
+            // Normal tracking mode: more balanced, but with stronger color than before
+            wGPS  = 0.20
+            wCont = 0.25
+            wSize = 0.20
+            wColor = 0.35  // ⬆️ bumped from 0.20 → 0.35
+        }
+
+        // Final composite score
         return wGPS * gpsScore
              + wCont * continuityScore
              + wSize * sizeScore
              + wColor * colorScore
     }
     
-    /// Pick the best target from candidates using GPS gating
+    /// Pick the best target from candidates using scoring (GPS/color/size/continuity)
+    /// Note: Hard lock logic is handled at the frame processing level, not here.
     private func pickBestTarget(
         candidates: [PersonDetection],
         expectedX: CGFloat?,
@@ -295,6 +404,7 @@ class FaceTracker: ObservableObject {
             fatalError("pickBestTarget called with empty candidates")
         }
         
+        // Normal scoring: pick highest-scoring candidate
         return candidates.max { a, b in
             scorePerson(a, expectedX: expectedX, previousCenter: previousCenter, pixelBuffer: pixelBuffer)
             <
@@ -324,12 +434,37 @@ class FaceTracker: ObservableObject {
         targetColorStrength = 1.0
         lastColorBox = bbox
 
+        // Hard lock: remember this specific target ID
+        isHardLocked = true
+        lockedTargetID = detection.id
+        framesSinceLockedSeen = 0
+
         // Publish normalized bbox as baseline size via callback
         let width = detection.width
         let height = detection.height
         onSubjectSizeLocked?(width, height)
 
-        print("✅ Locked subject color + size. width=\(width), height=\(height)")
+        // 🔵 Debug: color lock is active
+        isColorLockActive = true
+
+        // 🔵 Debug: store center of locked detection for blue dot (normalized 0..1)
+        let center = CGPoint(x: detection.x, y: detection.y)
+        hardLockCenter = center
+
+        // 🔵 Debug: preview color & RGB text
+        let r = CGFloat(avg.x)
+        let g = CGFloat(avg.y)
+        let b = CGFloat(avg.z)
+
+        let uiColor = UIColor(red: r, green: g, blue: b, alpha: 1.0)
+        lockedColorPreview = uiColor
+
+        let r255 = Int(round(r * 255.0))
+        let g255 = Int(round(g * 255.0))
+        let b255 = Int(round(b * 255.0))
+        lockedColorDebugText = "R:\(r255) G:\(g255) B:\(b255)"
+
+        print("✅ Hard-locked subject ID \(detection.id), color + size. width=\(width), height=\(height), \(lockedColorDebugText)")
     }
 
     // MARK: - Color sampling helpers

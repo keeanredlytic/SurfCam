@@ -3,6 +3,7 @@ import Vision
 import CoreMedia
 import ImageIO
 import UIKit
+import simd
 
 /// Represents a detected person with scoring information
 struct PersonDetection: Identifiable {
@@ -14,6 +15,7 @@ struct PersonDetection: Identifiable {
     let confidence: Float
     
     var area: CGFloat { width * height }
+    var aspectRatio: CGFloat { width / max(height, 0.0001) } // avoid /0
 }
 
 class FaceTracker: ObservableObject {
@@ -28,6 +30,15 @@ class FaceTracker: ObservableObject {
 
     // Bounding box of the current tracked person (normalized 0..1)
     @Published var targetBoundingBox: CGRect?
+
+    // Subject lock bridge
+    @Published var shouldLockSubject: Bool = false
+    var onSubjectSizeLocked: ((_ width: CGFloat, _ height: CGFloat) -> Void)?
+
+    // Color/size lock state
+    private var targetColor: SIMD3<Float>?
+    private var targetColorStrength: Float = 0.0
+    private var lastColorBox: CGRect?
 
     private let visionQueue = DispatchQueue(label: "FaceTracker.visionQueue")
     private var smoothedCenter: CGPoint? = nil
@@ -135,23 +146,23 @@ class FaceTracker: ObservableObject {
             let previous = self.smoothedCenter
             let chosen: PersonDetection
             
+            let pixelBufferRef = pixelBuffer
             if gpsGating, let expX = gpsExpectedX {
-                // GPS-gated selection: score each person
+                // GPS-gated selection: score each person (with color/size)
                 chosen = self.pickBestTarget(
                     candidates: detections,
                     expectedX: expX,
-                    previousCenter: previous
+                    previousCenter: previous,
+                    pixelBuffer: pixelBufferRef
                 )
-            } else if let prev = previous {
-                // No GPS: use position continuity
-                chosen = detections.min(by: { a, b in
-                    let da = hypot(a.x - prev.x, a.y - prev.y)
-                    let db = hypot(b.x - prev.x, b.y - prev.y)
-                    return da < db
-                })!
             } else {
-                // First frame: just pick the largest box
-                chosen = detections.max(by: { $0.area < $1.area })!
+                // No GPS: use scoring without GPS bias (expectedX nil)
+                chosen = self.pickBestTarget(
+                    candidates: detections,
+                    expectedX: nil,
+                    previousCenter: previous,
+                    pixelBuffer: pixelBufferRef
+                )
             }
 
             let rawCenter = CGPoint(x: chosen.x, y: chosen.y)
@@ -181,6 +192,13 @@ class FaceTracker: ObservableObject {
                     width: chosen.width,
                     height: chosen.height
                 )
+            
+            // Handle explicit subject lock request (color + size baseline)
+            if self.shouldLockSubject,
+               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                self.lockColorAndSize(from: pixelBuffer, using: chosen)
+                self.shouldLockSubject = false
+            }
             }
         }
 
@@ -198,52 +216,177 @@ class FaceTracker: ObservableObject {
     // MARK: - GPS-Gated Person Selection
     
     /// Score a person based on GPS proximity, continuity, and size
+    private func computeColorScore(
+        for person: PersonDetection,
+        pixelBuffer: CVPixelBuffer?
+    ) -> CGFloat {
+        guard let target = targetColor,
+              targetColorStrength > 0.1,
+              let pixelBuffer = pixelBuffer else {
+            return 0.0
+        }
+
+        let bbox = CGRect(
+            x: person.x - person.width / 2,
+            y: person.y - person.height / 2,
+            width: person.width,
+            height: person.height
+        )
+
+        guard let avg = averageColor(in: bbox, from: pixelBuffer) else { return 0.0 }
+        let sim = colorSimilarity(target, avg) // 0..1
+        let score = sim * targetColorStrength
+        return CGFloat(score)
+    }
+
     private func scorePerson(
         _ person: PersonDetection,
-        expectedX: CGFloat,
-        previousCenter: CGPoint?
-    ) -> Double {
+        expectedX: CGFloat?,
+        previousCenter: CGPoint?,
+        pixelBuffer: CVPixelBuffer?
+    ) -> CGFloat {
         // GPS proximity score (0..1)
-        var gpsScore = 0.0
-        let dx = abs(person.x - expectedX)
-        // If they're within 30% of screen width from where GPS says:
-        if dx < 0.3 {
-            gpsScore = 1.0 - Double(dx / 0.3)  // 1 at exact, 0 at edge
-        }
-        
-        // Continuity score: prefer whoever we were tracking last time
-        var continuityScore = 0.0
-        if let prev = previousCenter {
-            let dist = hypot(person.x - prev.x, person.y - prev.y)
-            // If within 20% of screen from previous position, give continuity bonus
-            if dist < 0.2 {
-                continuityScore = 1.0 - Double(dist / 0.2)
+        var gpsScore: CGFloat = 0.0
+        if let expX = expectedX {
+            let dx = abs(person.x - expX)
+            if dx < 0.3 {
+                gpsScore = 1.0 - (dx / 0.3)  // 1 at exact, 0 at edge
             }
         }
         
-        // Size score: favor closer (larger) people
-        let sizeScore = min(1.0, Double(person.area / 0.1))  // Normalize by ~10% screen area
+        // Continuity score: prefer whoever we were tracking last time
+        var continuityScore: CGFloat = 0.0
+        if let prev = previousCenter {
+            let dist = hypot(person.x - prev.x, person.y - prev.y)
+            if dist < 0.2 {
+                continuityScore = 1.0 - (dist / 0.2)
+            }
+        }
         
-        // Weighted sum - GPS is most important when available
-        return 0.50 * gpsScore +
-               0.35 * continuityScore +
-               0.15 * sizeScore
+        // Size score: favor closer (larger) people; prone → width matters more
+        let ar = person.aspectRatio
+        let isProne = ar < 0.6
+        let widthScore: CGFloat = min(1.0, person.width / 0.10)
+        let areaScore: CGFloat  = min(1.0, person.area / 0.02)
+        let sizeScore: CGFloat = isProne ? widthScore : areaScore
+
+        // Color score based on locked targetColor
+        let colorScore = computeColorScore(for: person, pixelBuffer: pixelBuffer)
+
+        let wGPS: CGFloat   = 0.25
+        let wCont: CGFloat  = 0.30
+        let wSize: CGFloat  = 0.25
+        let wColor: CGFloat = 0.20
+
+        return wGPS * gpsScore
+             + wCont * continuityScore
+             + wSize * sizeScore
+             + wColor * colorScore
     }
     
     /// Pick the best target from candidates using GPS gating
     private func pickBestTarget(
         candidates: [PersonDetection],
-        expectedX: CGFloat,
-        previousCenter: CGPoint?
+        expectedX: CGFloat?,
+        previousCenter: CGPoint?,
+        pixelBuffer: CVPixelBuffer?
     ) -> PersonDetection {
         guard !candidates.isEmpty else {
             fatalError("pickBestTarget called with empty candidates")
         }
         
         return candidates.max { a, b in
-            scorePerson(a, expectedX: expectedX, previousCenter: previousCenter)
+            scorePerson(a, expectedX: expectedX, previousCenter: previousCenter, pixelBuffer: pixelBuffer)
             <
-            scorePerson(b, expectedX: expectedX, previousCenter: previousCenter)
+            scorePerson(b, expectedX: expectedX, previousCenter: previousCenter, pixelBuffer: pixelBuffer)
         }!
+    }
+
+    // MARK: - Explicit color + size lock
+    func lockColorAndSize(
+        from pixelBuffer: CVPixelBuffer,
+        using detection: PersonDetection
+    ) {
+        let bbox = CGRect(
+            x: detection.x - detection.width / 2,
+            y: detection.y - detection.height / 2,
+            width: detection.width,
+            height: detection.height
+        )
+
+        guard let avg = averageColor(in: bbox, from: pixelBuffer) else {
+            print("⚠️ Failed to compute average color for lock.")
+            return
+        }
+
+        // Strongly set color
+        targetColor = avg
+        targetColorStrength = 1.0
+        lastColorBox = bbox
+
+        // Publish normalized bbox as baseline size via callback
+        let width = detection.width
+        let height = detection.height
+        onSubjectSizeLocked?(width, height)
+
+        print("✅ Locked subject color + size. width=\(width), height=\(height)")
+    }
+
+    // MARK: - Color sampling helpers
+    private func averageColor(in bbox: CGRect, from pixelBuffer: CVPixelBuffer) -> SIMD3<Float>? {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let baseAddr = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let width  = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+
+        // Convert normalized bbox → pixel coords and expand slightly
+        var rect = bbox
+        rect.origin.x *= CGFloat(width)
+        rect.origin.y *= CGFloat(height)
+        rect.size.width  *= CGFloat(width)
+        rect.size.height *= CGFloat(height)
+        rect = rect.insetBy(dx: -rect.width * 0.1, dy: -rect.height * 0.1) // expand 10%
+        rect.origin.x = max(0, rect.origin.x)
+        rect.origin.y = max(0, rect.origin.y)
+        rect.size.width = min(CGFloat(width) - rect.origin.x, rect.size.width)
+        rect.size.height = min(CGFloat(height) - rect.origin.y, rect.size.height)
+
+        let x0 = Int(rect.origin.x)
+        let y0 = Int(rect.origin.y)
+        let x1 = Int(rect.origin.x + rect.size.width)
+        let y1 = Int(rect.origin.y + rect.size.height)
+
+        var rSum: Float = 0
+        var gSum: Float = 0
+        var bSum: Float = 0
+        var count: Int = 0
+
+        for y in y0..<y1 {
+            let rowPtr = baseAddr.advanced(by: y * bytesPerRow)
+            for x in x0..<x1 {
+                let p = rowPtr.advanced(by: x * 4).assumingMemoryBound(to: UInt8.self)
+                // BGRA
+                let b = Float(p[0])
+                let g = Float(p[1])
+                let r = Float(p[2])
+                rSum += r; gSum += g; bSum += b
+                count += 1
+            }
+        }
+
+        guard count > 0 else { return nil }
+        return SIMD3<Float>(rSum / Float(count),
+                            gSum / Float(count),
+                            bSum / Float(count)) / 255.0
+    }
+
+    private func colorSimilarity(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Float {
+        let da = simd_normalize(a)
+        let db = simd_normalize(b)
+        let dot = max(0, simd_dot(da, db))
+        return dot // 0..1
     }
 }

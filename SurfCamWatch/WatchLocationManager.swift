@@ -20,7 +20,7 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
     @Published var calibrationSampleCount = 0
     @Published var lastCalibrationResult: String?  // Status message
     private var calibrationMode: CalibrationMode = .none
-
+    
     private let manager = CLLocationManager()
     private let session = WCSession.default
 
@@ -33,6 +33,18 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
     private var lastSentAt: Date = .distantPast
     private let minSendInterval: TimeInterval = 0.2  // ~5 Hz max (matches servo loop)
 
+
+    // MARK: - Subject lock (Vision assist)
+    /// Ask the phone to lock the current subject (color + size) via WCSession.
+    func requestSubjectLock() {
+        guard WCSession.isSupported(), session.isReachable else {
+            print("⚠️ Phone not reachable for lockSubject")
+            return
+        }
+        session.sendMessage(["lockSubject": true], replyHandler: nil) { error in
+            print("❌ Failed to send lockSubject: \(error.localizedDescription)")
+        }
+    }
     // Center calibration
     private var calibrationSamples: [CLLocation] = []
     private var calibrationTimer: Timer?
@@ -71,7 +83,7 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
     private func requestAuthorizationIfNeeded() {
         let locationStatus = manager.authorizationStatus
         if locationStatus == .notDetermined {
-            manager.requestWhenInUseAuthorization()
+        manager.requestWhenInUseAuthorization()
         }
 
         // Request HealthKit authorization for workout sessions
@@ -398,7 +410,7 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
 
     private func sendLocationToPhone(_ loc: CLLocation) {
         guard WCSession.isSupported(), session.isReachable else { return }
-
+        
         // Minimal payload for low overhead
         let payload: [String: Any] = [
             "lat": loc.coordinate.latitude,
@@ -406,12 +418,12 @@ class WatchLocationManager: NSObject, CLLocationManagerDelegate, ObservableObjec
             "ts": loc.timestamp.timeIntervalSince1970,
             "acc": loc.horizontalAccuracy
         ]
-
+        
         session.sendMessage(["locations": [payload]], replyHandler: nil) { error in
             print("WC send error: \(error.localizedDescription)")
         }
     }
-
+    
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         print("Location error: \(error.localizedDescription)")
     }

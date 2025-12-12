@@ -68,7 +68,7 @@ struct ContentView: View {
                         
                         Slider(value: $angle, in: 0...180, step: 1) { isEditing in
                             if !isEditing {
-                                api.track(angle: Int(angle))
+                                api.trackPan(angle: Int(angle))
                             }
                         }
                     }
@@ -76,32 +76,32 @@ struct ContentView: View {
                     HStack(spacing: 8) {
                         Button("Left (0°)") {
                             angle = 0
-                            api.track(angle: 0)
+                            api.trackPan(angle: 0)
                         }
                         .buttonStyle(PillButtonStyle())
                         
                         Button("Center (90°)") {
                             angle = 90
-                            api.center()
+                            api.centerPan()
                         }
                         .buttonStyle(PillButtonStyle())
                         
                         Button("Right (180°)") {
                             angle = 180
-                            api.track(angle: 180)
+                            api.trackPan(angle: 180)
                         }
                         .buttonStyle(PillButtonStyle())
                     }
                     
                     HStack(spacing: 8) {
                         Button("Step -15°") {
-                            api.step(delta: -15)
+                            api.stepPan(delta: -15)
                             angle = max(0, angle - 15)
                         }
                         .buttonStyle(PillButtonStyle())
                         
                         Button("Step +15°") {
-                            api.step(delta: 15)
+                            api.stepPan(delta: 15)
                             angle = min(180, angle + 15)
                         }
                         .buttonStyle(PillButtonStyle())

@@ -90,9 +90,16 @@ class PanRigAPI: ObservableObject {
     private let webRequester = WebViewRequester()
 
     @Published var statusText: String = "Ready"
-    @Published var currentAngle: Double = 90   // 0–180
-    @Published var minAngle: Double = 10   // adjust for your mount
-    @Published var maxAngle: Double = 170
+
+    // PAN (0–180, but we clamp to a safer envelope)
+    @Published var currentPanAngle: Double = 90
+    @Published var minPanAngle: Double = 10   // adjust for your mount
+    @Published var maxPanAngle: Double = 170
+
+    // TILT (80–180 as defined on ESP32)
+    @Published var currentTiltAngle: Double = 180
+    let minTiltAngle: Double = 80
+    let maxTiltAngle: Double = 180
     
     // Test ESP32 connectivity
     func testConnection() {
@@ -121,21 +128,39 @@ class PanRigAPI: ObservableObject {
         }
     }
 
-    func track(angle: Int) {
-        let clamped = max(Int(minAngle), min(Int(maxAngle), angle))
-        currentAngle = Double(clamped)
+    // MARK: - PAN
+    func trackPan(angle: Int) {
+        let clamped = max(Int(minPanAngle), min(Int(maxPanAngle), angle))
+        currentPanAngle = Double(clamped)
         send(path: "/track?angle=\(clamped)")
     }
 
-    func step(delta: Int) {
-        let raw = currentAngle + Double(delta)
-        let newAngle = max(minAngle, min(maxAngle, raw))
-        currentAngle = newAngle
+    func stepPan(delta: Int) {
+        let raw = currentPanAngle + Double(delta)
+        let newAngle = max(minPanAngle, min(maxPanAngle, raw))
+        currentPanAngle = newAngle
         send(path: "/step?delta=\(delta)")
     }
 
-    func center() {
-        currentAngle = 90
+    func centerPan() {
+        currentPanAngle = 90
         send(path: "/center")
     }
+
+    // MARK: - TILT
+    func trackTilt(angle: Int) {
+        let clamped = max(Int(minTiltAngle), min(Int(maxTiltAngle), angle))
+        currentTiltAngle = Double(clamped)
+        send(path: "/trackTilt?angle=\(clamped)")
+    }
+
+    func centerTilt() {
+        currentTiltAngle = 90
+        send(path: "/centerTilt")
+    }
+
+    // MARK: - Legacy wrappers (pan)
+    func track(angle: Int) { trackPan(angle: angle) }
+    func step(delta: Int)  { stepPan(delta: delta) }
+    func center()          { centerPan() }
 }

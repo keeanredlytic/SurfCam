@@ -87,12 +87,22 @@ final class ZoomController: ObservableObject {
     @Published private(set) var zoomFactor: CGFloat = 1.0
     @Published private(set) var currentHFOV: Double = ZoomPreset.wide1.anchorHFOV
     
-    @Published var mode: ZoomMode = .fixed(1.0)
+    @Published var mode: ZoomMode = .fixed(1.0) {
+        didSet {
+            if case .autoSubjectWidth = mode {
+                narrowFrames = 0
+                wideFrames = 0
+            }
+        }
+    }
     @Published var isSearching = false
 
     // Auto-distance state
     private var lastZoomDistanceMeters: Double?
     private var basePresetWhenAutoStarted: ZoomPreset?
+    // Auto-subject-width persistence counters
+    private var narrowFrames = 0
+    private var wideFrames = 0
     
     // MARK: - Dependencies
     weak var videoDevice: AVCaptureDevice?
@@ -100,7 +110,7 @@ final class ZoomController: ObservableObject {
     
     // MARK: - Limits / steps
     let minZoom: CGFloat = 0.5    // allow ultra-wide on multi-cam devices
-    let maxZoom: CGFloat = 6.0    // camera manager will clamp to device max
+    let maxZoom: CGFloat = 8.0    // manual/UI cap; device clamp handles higher (auto can exceed)
     let defaultZoom: CGFloat = 1.0
     let zoomStep: CGFloat = 0.1
     
@@ -149,6 +159,10 @@ final class ZoomController: ObservableObject {
             
         case .autoDistance:
             // Distance-based zoom is driven elsewhere (CameraScreen.tickTracking)
+            break
+
+        case .autoSubjectWidth:
+            // Vision-driven width auto zoom is driven from CameraScreen
             break
 
         case .off:
@@ -262,60 +276,98 @@ final class ZoomController: ObservableObject {
         return false
     }
 
-    // MARK: - Vision-driven subject-width auto zoom
-    /// Adjusts zoom based on the normalized width (0..1) of the tracked subject.
-    /// Keeps surfer roughly in 7–10% of frame width, with a deadband to avoid jitter.
+    // MARK: - Auto Subject Width toggles
+    func enableAutoSubjectWidth() {
+        narrowFrames = 0
+        wideFrames = 0
+        mode = .autoSubjectWidth
+    }
+
+    func disableAutoSubjectWidth() {
+        mode = .fixed(zoomFactor)
+        narrowFrames = 0
+        wideFrames = 0
+    }
+
+    var isAutoSubjectWidthEnabled: Bool {
+        if case .autoSubjectWidth = mode { return true }
+        return false
+    }
+
+        // MARK: - Vision-driven subject-width auto zoom (baseline-aware)
+    /// Adjusts zoom based on the normalized width (0..1) of the tracked subject vs baseline.
     func updateZoomForSubjectWidth(
         normalizedWidth: CGFloat?,
+        baselineWidth: CGFloat?,
         cameraManager: CameraSessionManager
     ) {
-        // Only act in the correct mode
         guard case .autoSubjectWidth = mode else { return }
-        guard let width = normalizedWidth else { return }
+        guard let width = normalizedWidth,
+              let baseline = baselineWidth,
+              width > 0.01 else { return }
 
-        // Width bands
-        let hardZoomIn: CGFloat  = 0.05   // <5% of width → strongly zoom in
-        let sweetMin: CGFloat    = 0.07   // 7% → lower sweet bound
-        let sweetMax: CGFloat    = 0.10   // 10% → upper sweet bound
-        let hardZoomOut: CGFloat = 0.14   // >14% → strongly zoom out
+        // Ratio vs baseline
+        let ratio = width / baseline
+
+        // Dead zone (±20%)
+        let innerMin: CGFloat = 0.8
+        let innerMax: CGFloat = 1.2
+
+        // Outer bands (more aggressive)
+        let outerMin: CGFloat = 0.6
+        let outerMax: CGFloat = 1.6
+
+        // Persistence based on ratio
+        if ratio < innerMin {
+            narrowFrames &+= 1
+            wideFrames = 0
+        } else if ratio > innerMax {
+            wideFrames &+= 1
+            narrowFrames = 0
+        } else {
+            narrowFrames = 0
+            wideFrames = 0
+        }
+        let minTriggerFrames = 5
 
         let current = zoomFactor
         var targetZoom = current
 
-        // Decide target zoom based on how big the surfer is in frame
-        if width < hardZoomIn {
-            targetZoom = current * 1.35
-        } else if width < sweetMin {
-            targetZoom = current * 1.10
-        } else if width > hardZoomOut {
-            targetZoom = current * 0.70
-        } else if width > sweetMax {
-            targetZoom = current * 0.90
+        if ratio < outerMin, narrowFrames >= minTriggerFrames {
+            let factor = min(1.6, max(1.1, 1.0 + (outerMin - ratio) * 1.5))
+            targetZoom = current * factor
+        } else if ratio < innerMin, narrowFrames >= minTriggerFrames {
+            targetZoom = current * 1.05
+        } else if ratio > outerMax, wideFrames >= minTriggerFrames {
+            let factor = max(0.6, min(0.9, 1.0 - (ratio - outerMax) * 0.5))
+            targetZoom = current * factor
+        } else if ratio > innerMax, wideFrames >= minTriggerFrames {
+            targetZoom = current * 0.95
         } else {
-            // inside 7–10% sweet zone: do nothing
             return
         }
 
-        // Logical zoom safety range (device will clamp further)
         let minFactor: CGFloat = 0.5
-        let maxFactor: CGFloat = 24.0
+        let maxFactor: CGFloat = 24.0    // allow full 24x when necessary
         targetZoom = max(minFactor, min(maxFactor, targetZoom))
 
-        // Smooth toward the target & cap per-tick change
+        // Zoom-aware smoothing
         let alpha: CGFloat = 0.25
         var newZoom = current + alpha * (targetZoom - current)
-        let maxDeltaPerTick: CGFloat = 0.20
+
+        let baseMaxDeltaPerTick: CGFloat = 0.20
+        let zoomSlowdown = 1.0 / (1.0 + 0.3 * max(0.0, current - 4.0))
+        let maxDeltaPerTick = baseMaxDeltaPerTick * zoomSlowdown
         let delta = max(-maxDeltaPerTick, min(maxDeltaPerTick, newZoom - current))
         newZoom = current + delta
 
-        // Ignore tiny changes
         if abs(newZoom - current) < 0.01 { return }
 
         cameraManager.setZoom(newZoom)
         DispatchQueue.main.async { self.zoomFactor = newZoom }
     }
-    
-    // MARK: - Distance → Zoom mapping
+
+// MARK: - Distance → Zoom mapping
     private func targetZoom(for distanceMeters: Double) -> CGFloat {
         let d = max(0.0, distanceMeters)
         

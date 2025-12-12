@@ -21,6 +21,7 @@ class WatchGPSTracker: NSObject, ObservableObject, WCSessionDelegate {
     
     // Optional provider for rig coordinates to run distance sanity check
     var rigCoordinateProvider: (() -> CLLocationCoordinate2D?)?
+    var onLockSubject: (() -> Void)?
     
     // Smoothing parameters
     private let smoothingAlpha: Double = 0.4  // faster response
@@ -81,6 +82,9 @@ class WatchGPSTracker: NSObject, ObservableObject, WCSessionDelegate {
                 } else {
                     print("⚠️ Received rigCalibration from watch but no handler is set.")
                 }
+                return
+            } else if let lock = message["lockSubject"] as? Bool, lock {
+                self.onLockSubject?()
                 return
             }
             

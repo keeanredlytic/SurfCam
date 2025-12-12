@@ -28,45 +28,45 @@ struct ControlsScreen: View {
                             Text("Pan angle")
                                 .foregroundColor(Color(.systemGray3))
                             Spacer()
-                            Text("\(Int(api.currentAngle))°")
+                            Text("\(Int(api.currentPanAngle))°")
                                 .foregroundColor(.white)
                                 .fontWeight(.semibold)
                         }
                         
                         Slider(value: Binding(
-                            get: { api.currentAngle },
+                            get: { api.currentPanAngle },
                             set: { newVal in
-                                api.currentAngle = newVal
-                                api.track(angle: Int(newVal))
+                                api.currentPanAngle = newVal
+                                api.trackPan(angle: Int(newVal))
                             }
-                        ), in: api.minAngle...api.maxAngle, step: 1)
+                        ), in: api.minPanAngle...api.maxPanAngle, step: 1)
                     }
                     
                     HStack(spacing: 8) {
                         Button("Left (0°)") {
-                            api.track(angle: 0)
+                            api.trackPan(angle: 0)
                         }
                         .buttonStyle(PillButtonStyle())
                         
                         Button("Center (90°)") {
-                            api.center()
+                            api.centerPan()
                         }
                         .buttonStyle(PillButtonStyle())
                         
                         Button("Right (180°)") {
-                            api.track(angle: 180)
+                            api.trackPan(angle: 180)
                         }
                         .buttonStyle(PillButtonStyle())
                     }
                     
                     HStack(spacing: 8) {
                         Button("Step -15°") {
-                            api.step(delta: -15)
+                            api.stepPan(delta: -15)
                         }
                         .buttonStyle(PillButtonStyle())
                         
                         Button("Step +15°") {
-                            api.step(delta: 15)
+                            api.stepPan(delta: 15)
                         }
                         .buttonStyle(PillButtonStyle())
                     }

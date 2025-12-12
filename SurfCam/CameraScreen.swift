@@ -43,6 +43,95 @@ struct CameraScreen: View {
         self.gpsTracker = gpsTracker
         self.zoomController = zoomController
         self.cameraManager = cameraManager
+
+    }
+
+    // MARK: - Subject width smoothing + auto zoom helper
+    private func updateSubjectWidthAndAutoZoom() {
+        // 1) Smooth subject width from Vision bbox
+        if let bbox = faceTracker.targetBoundingBox {
+            let rawWidth = bbox.width       // 0..1 normalized
+
+            // Ignore clearly bogus tiny widths
+            guard rawWidth > 0.01 else {
+                smoothedSubjectWidth = nil
+                subjectWidthFrameCounter = 0
+                return
+            }
+
+            let alpha: CGFloat = 0.4
+            if let prev = smoothedSubjectWidth {
+                smoothedSubjectWidth = prev * (1 - alpha) + rawWidth * alpha
+            } else {
+                smoothedSubjectWidth = rawWidth
+            }
+            subjectWidthFrameCounter &+= 1
+            if subjectWidthFrameCounter % 30 == 0, let w = smoothedSubjectWidth {
+                print("🔍 Subject width (smoothed): \(String(format: "%.3f", w))")
+            }
+            subjectWidthHoldFrames = 5 // keep width alive briefly if bbox flickers
+        } else {
+            subjectWidthFrameCounter = 0
+            if subjectWidthHoldFrames > 0 {
+                subjectWidthHoldFrames -= 1
+            } else {
+                smoothedSubjectWidth = nil
+            }
+        }
+
+        // 2) Vision-driven auto zoom (skip while in passiveHold)
+        guard recoveryMode != .passiveHold else { return }
+
+        guard trackState == .locked else { return }
+        guard subjectWidthFrameCounter >= 10 else { return }
+        guard let faceCenter = faceTracker.faceCenter else { return }
+        let horizontalOffset = abs(faceCenter.x - 0.5)
+        let isWellCentered = horizontalOffset < 0.20
+        guard isWellCentered else { return }
+
+        if let width = smoothedSubjectWidth,
+           let targetWidth = targetSubjectWidth {
+            zoomController.updateZoomForSubjectWidth(
+                normalizedWidth: width,
+                baselineWidth: targetWidth,
+                cameraManager: cameraManager
+            )
+        }
+    }
+
+    // MARK: - Passive hold helpers
+    private func handleNoTargetFrame() {
+        // No valid bbox this frame
+        smoothedSubjectWidth = nil
+
+        switch recoveryMode {
+        case .none:
+            // Just lost target on this frame
+            if framesSinceLastTarget == 1 {
+                enterPassiveHold()
+            }
+
+        case .passiveHold:
+            // Still waiting; optional: mark lost after hold duration
+            if framesSinceLastTarget == passiveHoldFrames {
+                print("⚠️ Still no surfer after \(passiveHoldFrames) frames (passive hold).")
+                // Optional: trackState = .lost
+            }
+        }
+    }
+
+    private func enterPassiveHold() {
+        recoveryMode = .passiveHold
+
+        // Remember zoom behavior to restore later
+        zoomModeBeforeHold = zoomController.mode
+        zoomBeforeHold = zoomController.zoomFactor
+
+        // Freeze zoom at current level
+        zoomController.mode = .fixed(zoomController.zoomFactor)
+
+        // We do NOT move the servo here (applyVisionFollower only runs when target present)
+        print("🛑 Entering passive hold (duck-dive / fall recovery).")
     }
 
     @State private var trackingMode: TrackingMode = .off
@@ -95,8 +184,40 @@ struct CameraScreen: View {
     /// Last smoothed watch location, for speed + motion heading
     @State private var lastSmoothedWatchLocation: CLLocation?
     /// Smoothed subject width from Vision (for autoSubjectWidth)
-    private var smoothedSubjectWidth: CGFloat?
-    private var subjectWidthFrameCounter: Int = 0
+    @State private var smoothedSubjectWidth: CGFloat?
+    @State private var subjectWidthFrameCounter: Int = 0
+    @State private var subjectWidthHoldFrames: Int = 0
+    @State private var lastCommandedPanAngle: CGFloat?
+    @State private var lastCommandedTiltAngle: CGFloat?
+    // MARK: - Short-term loss recovery (duck-dive / quick fall)
+    private enum RecoveryMode {
+        case none        // normal tracking
+        case passiveHold // we just lost the target; hold zoom & pan and wait
+    }
+    @State private var recoveryMode: RecoveryMode = .none
+    @State private var framesSinceLastTarget: Int = 0
+    /// How long we "trust" they'll pop back up (20 Hz tick => 60 ≈ 3.0s)
+    private let passiveHoldFrames: Int = 60
+    /// For restoring zoom behavior
+    @State private var zoomModeBeforeHold: ZoomMode = .fixed(1.0)
+    @State private var zoomBeforeHold: CGFloat?
+    
+    // MARK: - Session subject model
+    @State private var baselineSubjectWidth: CGFloat?
+    @State private var baselineSubjectHeight: CGFloat?
+    private var hasLockedSubject: Bool { baselineSubjectWidth != nil }
+    // For color lock trigger
+    private var pendingColorLockRequest: Bool = false
+    private var targetSubjectWidth: CGFloat? {
+        // For now, use baseline width directly; can be tuned per mode later
+        return baselineSubjectWidth
+    }
+
+    // MARK: - Subject lock API (UI/Watch)
+    func requestSubjectLock() {
+        faceTracker.shouldLockSubject = true
+        print("🎯 Subject lock requested from UI/Watch.")
+    }
     
     // MARK: - GPS + Vision Fusion Constants
     /// When searching: how close Vision.x must be to GPS-predicted X (0–1) to accept a person
@@ -187,8 +308,8 @@ struct CameraScreen: View {
                             .padding(.vertical, 4)
                             .background(Color.black.opacity(0.5))
                             .cornerRadius(4)
-                        }
-                        
+                }
+                
                         // Resolution toggle (only when not recording)
                         if !cameraManager.isRecording {
                             HStack(spacing: 6) {
@@ -239,7 +360,7 @@ struct CameraScreen: View {
                                         Text("—")
                                             .font(.caption2)
                                             .foregroundColor(.white.opacity(0.5))
-                                    }
+                        }
                                 } else if let watchLoc = gpsTracker.smoothedLocation {
                                     Text(String(format: "±%.0fm", watchLoc.horizontalAccuracy))
                                         .font(.caption2)
@@ -252,8 +373,8 @@ struct CameraScreen: View {
                                     Text("GPS...")
                                         .font(.caption2)
                                         .foregroundColor(.white.opacity(0.5))
-                                }
-                            }
+                    }
+                }
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
                             .background(Color.black.opacity(0.5))
@@ -272,7 +393,11 @@ struct CameraScreen: View {
                         
                         Spacer()
                         
-                        autoZoomButton
+                        VStack(spacing: 6) {
+                            autoZoomButton
+                            lockSubjectButton
+                            subjectLockPill
+                        }
                         
                         Spacer()
                         
@@ -341,8 +466,8 @@ struct CameraScreen: View {
                                             .frame(width: 44, height: 44)
                                     }
                                 }
-                            }
-                            
+                }
+                
                             // System panel toggle
                             Button(action: { showSystemPanel.toggle() }) {
                                 Image(systemName: showSystemPanel ? "chevron.down" : "chevron.up")
@@ -405,8 +530,8 @@ struct CameraScreen: View {
                                                                 .font(.caption2)
                                                                 .foregroundColor(.red)
                                                                 .lineLimit(2)
-                                                        }
-                                                        }
+                        }
+                    }
                                                     }
                                                     Spacer()
                                                 }
@@ -433,7 +558,7 @@ struct CameraScreen: View {
                                                         Text("Samples: \(gpsTracker.watchCalibrationSampleCount)")
                                                             .font(.caption2)
                                                             .foregroundColor(.white.opacity(0.7))
-                                                    }
+                }
                                                     } else {
                                                         Text("Tap on Watch")
                                                             .font(.caption2)
@@ -633,6 +758,15 @@ struct CameraScreen: View {
                 }
                 }
                 .onAppear {
+                    // Wire subject size lock callback (set at runtime to avoid escaping self in init)
+                    faceTracker.onSubjectSizeLocked = { width, height in
+                        baselineSubjectWidth = width
+                        baselineSubjectHeight = height
+                    }
+                    gpsTracker.onLockSubject = {
+                        requestSubjectLock()
+                    }
+
                     // Initialize resolution and FPS
                     cameraManager.targetFPS = 30.0
                     cameraManager.resolution = use4K ? .uhd4K : .hd1080
@@ -883,39 +1017,45 @@ struct CameraScreen: View {
     // MARK: - Camera AI tracking (Vision-based)
     
     private func trackWithCameraAI() {
-        guard let faceCenter = faceTracker.faceCenter else {
-            smoothedSubjectWidth = nil
+        let hasTarget = (faceTracker.faceCenter != nil)
+
+        if hasTarget {
+            framesSinceLastTarget = 0
+
+            // Exit recovery if we just reacquired
+            if recoveryMode == .passiveHold {
+                handleReacquiredAfterPassiveHold()
+            }
+
+            // Horizontal tracking (pan) and vertical framing (tilt)
+            if let faceCenter = faceTracker.faceCenter {
+                applyVisionFollower(from: faceCenter)
+                applyTiltFollower(from: faceCenter)
+            }
+
+            // Subject width + auto zoom
+            updateSubjectWidthAndAutoZoom()
+            return
+        } else {
+            // No target this frame
+            framesSinceLastTarget &+= 1
+            handleNoTargetFrame()
             return
         }
-        
-        // 1) Horizontal tracking (existing behavior)
-        applyVisionFollower(from: faceCenter)
-        
-        // 2) Compute & smooth subject width
-        if let bbox = faceTracker.targetBoundingBox {
-            let rawWidth = bbox.width    // 0..1 normalized width
-            let alpha: CGFloat = 0.4
-            if let prev = smoothedSubjectWidth {
-                smoothedSubjectWidth = prev * (1 - alpha) + rawWidth * alpha
-            } else {
-                smoothedSubjectWidth = rawWidth
-            }
-            subjectWidthFrameCounter &+= 1
-            if subjectWidthFrameCounter % 30 == 0, let w = smoothedSubjectWidth {
-                print("🔍 Subject width (smoothed): \(String(format: \"%.3f\", w))")
-            }
+    }
+
+    private func handleReacquiredAfterPassiveHold() {
+        recoveryMode = .none
+        framesSinceLastTarget = 0
+
+        // Restore auto-zoom mode if we were using it before
+        if case .autoSubjectWidth = zoomModeBeforeHold {
+            zoomController.mode = .autoSubjectWidth
         } else {
-            smoothedSubjectWidth = nil
+            zoomController.mode = zoomModeBeforeHold
         }
-        
-        // 3) Auto zoom based on subject width (Vision-driven)
-        if let width = smoothedSubjectWidth,
-           let zoomController = zoomController {
-            zoomController.updateZoomForSubjectWidth(
-                normalizedWidth: width,
-                cameraManager: cameraManager
-            )
-        }
+
+        print("✅ Reacquired surfer after passive hold.")
     }
     
     // MARK: - Watch GPS tracking
@@ -976,7 +1116,7 @@ struct CameraScreen: View {
         if let expectedX = gpsExpectedX {
             updateGPSQualityMetrics(faceCenter: faceCenter, expectedX: expectedX)
         }
-        
+
         // 2) Vision-only servo control (same as AI mode)
         applyVisionFollower(from: faceCenter)
         
@@ -1066,49 +1206,82 @@ struct CameraScreen: View {
     }
     
     // MARK: - Vision Follower (Shared Logic)
-    
-    /// Shared vision-based servo control used by both AI mode and GPS+AI locked state
-    /// Ensures coordinate consistency across all Vision tracking modes
-    /// Shared vision-based servo control used by both AI mode and GPS+AI locked state
-    /// Adding a small center bias lets us nudge the "true center" a couple degrees.
     private func applyVisionFollower(from faceCenter: CGPoint) {
-        // Vision coordinates: 0..1, left→right
-        let x = faceCenter.x
-        
-        // --- Center bias logic ---
-        // Base mechanical bias
-        let gain: CGFloat = 10.0                // slightly higher gain for quicker corrections
+        let x = faceCenter.x // 0..1
+
+        // Current zoom factor (UI space)
+        let zoom = zoomController.zoomFactor
+        let zoomClamped = max(1.0, min(zoom, 8.0)) // for control math
+
+        // ---- Zoom-aware control tuning ----
+        let baseGain: CGFloat = 10.0
+        let baseDeadband: CGFloat = 0.02
+        let baseMaxStep: CGFloat = 4.0
+
+        // Less aggressive scaling to keep authority at high zoom
+        let gainScale = 1.0 / (1.0 + 0.25 * (zoomClamped - 1.0))
+        let gain = baseGain * gainScale
+
+        let deadbandScale = 1.0 + 0.5 * (zoomClamped - 1.0) / 7.0
+        let deadband: CGFloat = baseDeadband * deadbandScale
+
+        let maxStep: CGFloat = baseMaxStep * gainScale
+
+        let servoMirror: CGFloat = -1.0
         let baseBiasDegrees: CGFloat = centerBiasDegrees
-        // Per-lens tweak (persisted)
         let lensBiasDegrees: CGFloat = zoomController.currentPreset.lensCenterBiasDegrees
         let totalBiasDegrees = baseBiasDegrees + lensBiasDegrees
         let centerBiasNorm = totalBiasDegrees / gain
-        // Apply bias in normalized screen-space BEFORE computing offset:
-        //  - If bias > 0, this effectively shifts the "zero offset" point.
-        let offset = (x + centerBiasNorm) - 0.5    // -0.5..+0.5 around biased center
+
+        let offset = (x + centerBiasNorm) - 0.5
         print("📐 center bias preset=\(zoomController.currentPreset.displayName) base=\(baseBiasDegrees) lens=\(lensBiasDegrees) total=\(totalBiasDegrees)")
-        // -------------------------
-        
-        // Deadband: tighter deadband → reacts sooner
-        let deadband: CGFloat = 0.03              // was 0.02, now 0.03 for more responsive tracking
+
         if abs(offset) < deadband { return }
 
-        // Convert normalized offset to degrees
-        var step = offset * gain * servoMirror                  // degrees left/right
-        
-        // Clamp per-tick step size
-        let maxStep: CGFloat = 4.0
-        if step > maxStep { step = maxStep }
-        if step < -maxStep { step = -maxStep }
-        
-        // Apply to servo with safe clamping
-        let currentAngle = CGFloat(api.currentAngle)
-        let newAngle = clampAngle(currentAngle + step)  // 15°–165° in your helpers
-        sendServoAngle(Int(newAngle))
-    }
-    
+        var step = offset * gain * servoMirror
+        step = max(-maxStep, min(maxStep, step))
 
-    // MARK: - Distance + Motion Update
+        let currentAngle = CGFloat(api.currentPanAngle)
+        let newAngle = clampAngle(currentAngle + step) // 15–165
+        sendPanAngle(Int(newAngle))
+    }
+
+    // MARK: - Tilt follower (vertical framing)
+    private func applyTiltFollower(from faceCenter: CGPoint) {
+        let y = faceCenter.y // 0..1, top → bottom
+
+        // Desired vertical position of surfer (slightly below center to keep more sky/horizon)
+        let desiredY: CGFloat = 0.55
+
+        let zoom = zoomController.zoomFactor
+        let zoomClamped = max(1.0, min(zoom, 8.0))
+
+        let baseGain: CGFloat = 80.0   // degrees of tilt per normalized offset
+        let baseDeadband: CGFloat = 0.02
+        let baseMaxStep: CGFloat = 5.0
+
+        // Slightly reduce gain at high zoom
+        let gainScale = 1.0 / (1.0 + 0.25 * (zoomClamped - 1.0))
+        let gain = baseGain * gainScale
+        let deadband = baseDeadband
+        let maxStep = baseMaxStep * gainScale
+
+        // Offset: positive means surfer is LOWER than desired
+        let offset = y - desiredY
+        if abs(offset) < deadband { return }
+
+        var step = offset * gain
+
+        // Limit max step
+        step = max(-maxStep, min(maxStep, step))
+
+        let currentTilt = CGFloat(api.currentTiltAngle)
+        let newTilt = clampTiltAngle(currentTilt + step)
+
+        sendTiltAngle(Int(newTilt))
+    }
+
+// MARK: - Distance + Motion Update
     private func updateDistanceAndMotionIfPossible() {
         guard
             let rigCoord = rigLocationManager.rigCalibratedCoord ?? rigLocationManager.rigLocation?.coordinate,
@@ -1289,10 +1462,51 @@ struct CameraScreen: View {
     }
     
     /// Send servo angle command and update tracked angle
-    private func sendServoAngle(_ angle: Int) {
-        // Use existing PanRigAPI.track(angle:)
-        api.track(angle: angle)
-        // Note: api.currentAngle is @Published and will update automatically
+    // MARK: - PAN servo state
+
+    /// Send pan angle command and update tracked angle
+    private func sendPanAngle(_ angle: Int) {
+        let raw = CGFloat(angle)
+        let zoom = zoomController.zoomFactor
+        
+        // Stronger smoothing at high zoom (slightly relaxed for responsiveness)
+        let alpha: CGFloat = zoom >= 6.0 ? 0.4 : 0.6  // 0.6 = snappier, 0.4 = smoother
+        
+        let smoothed: CGFloat
+        if let last = lastCommandedPanAngle {
+            smoothed = last + alpha * (raw - last)
+        } else {
+            smoothed = raw
+        }
+        
+        lastCommandedPanAngle = smoothed
+        api.trackPan(angle: Int(smoothed.rounded()))
+        // Note: api.currentPanAngle is @Published and will update automatically
+    }
+
+    // MARK: - TILT servo state
+
+    /// Clamp tilt angle to the ESP32’s allowed range (80–180)
+    private func clampTiltAngle(_ angle: CGFloat) -> CGFloat {
+        return max(80, min(180, angle))
+    }
+
+    /// Send tilt angle command (smoothing independent of zoom)
+    private func sendTiltAngle(_ angle: Int) {
+        let raw = CGFloat(angle)
+        let alpha: CGFloat = 0.6 // relaxed, tilt doesn’t need zoom coupling
+
+        let smoothed: CGFloat
+        if let last = lastCommandedTiltAngle {
+            smoothed = last + alpha * (raw - last)
+        } else {
+            smoothed = raw
+        }
+
+        let clamped = clampTiltAngle(smoothed)
+        lastCommandedTiltAngle = clamped
+        api.trackTilt(angle: Int(clamped.rounded()))
+        // Note: api.currentTiltAngle is @Published and will update automatically
     }
     
     /// Compute where GPS says the target should appear on screen (0..1)
@@ -1310,7 +1524,7 @@ struct CameraScreen: View {
         
         // Convert current servo angle to compass heading
         let currentHeading = servoAngleToHeading(
-            servoAngle: api.currentAngle,
+            servoAngle: api.currentPanAngle,
             calibratedBearing: calBearing
         )
         
@@ -1340,8 +1554,8 @@ struct CameraScreen: View {
         let rawStep = Double(offset) * gain
         let step = max(-maxStep, min(maxStep, rawStep))
         
-        let newAngle = clampAngle(CGFloat(api.currentAngle) + CGFloat(step))
-        sendServoAngle(Int(newAngle))
+        let newAngle = clampAngle(CGFloat(api.currentPanAngle) + CGFloat(step))
+        sendPanAngle(Int(newAngle))
     }
     
     private func servoAngleForCurrentGPS() -> Double? {
@@ -1437,13 +1651,42 @@ struct CameraScreen: View {
         return abs(zoomController.zoomFactor - CGFloat(zoom)) < 0.1
     }
 
+    // MARK: - Subject Lock UI
+    private var lockSubjectButton: some View {
+        Button(action: {
+            requestSubjectLock()
+        }) {
+            Text("Lock Surfer")
+                .font(.system(size: 14, weight: .semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.blue.opacity(0.85))
+                .foregroundColor(.white)
+                .clipShape(Capsule())
+        }
+    }
+
+    private var subjectLockPill: some View {
+        Group {
+            if hasLockedSubject {
+                Text("Subject locked ✅")
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.green.opacity(0.75))
+                    .foregroundColor(.white)
+                    .clipShape(Capsule())
+            }
+        }
+    }
+
     // MARK: - Auto Zoom Toggle
     private var autoZoomButton: some View {
         Button(action: {
             if case .autoSubjectWidth = zoomController.mode {
-                zoomController.mode = .fixed(zoomController.zoomFactor)
+                zoomController.disableAutoSubjectWidth()
             } else {
-                zoomController.mode = .autoSubjectWidth
+                zoomController.enableAutoSubjectWidth()
             }
         }) {
             Text("Auto Zoom")
@@ -1451,7 +1694,7 @@ struct CameraScreen: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .background(
-                    (zoomController.mode == .autoSubjectWidth)
+                    zoomController.isAutoSubjectWidthEnabled
                     ? Color.green.opacity(0.85)
                     : Color.black.opacity(0.6)
                 )
